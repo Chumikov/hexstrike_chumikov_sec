@@ -78,7 +78,7 @@ pgrep -c gunicorn
 
 ### Скрипт автозапуска
 
-Файл `OpenCodeStart.sh` копируем в папку проекта - `/usr/share/hexstrike-ai/`
+Файл `OpenCodeStart.sh` копируем в папку HexStrike - `/usr/share/hexstrike-ai/`
 
 Скрипт автоматически:
 1. Проверяет доступность сервера на `http://127.0.0.1:8888/health`
@@ -116,7 +116,7 @@ pgrep -c gunicorn
 
 ## Изменения в hexstrike_server.py
 
-Файл `hexstrike_server.py` копируем в папку проекта - `/usr/share/hexstrike-ai/` заменяя изначальную версию
+Файл `hexstrike_server.py` копируем в папку HexStrike - `/usr/share/hexstrike-ai/` заменяя изначальную версию
 
 **Что было изменено:**
 
@@ -130,14 +130,14 @@ pgrep -c gunicorn
 
 ### Кэширование
 
-- **Размер кэша** увеличен с 1000 до **2000** записей
-- **TTL кэша** увеличен с 3600 до **7200** секунд (2 часа)
+- Размер кэша увеличен с 1000 до **2000** записей
+- TTL кэша увеличен с 3600 до **7200** секунд (2 часа)
 
 ---
 
 ## Изменения в hexstrike_mcp.py
 
-Файл `hexstrike_mcp.py` копируем в папку проекта - `/usr/share/hexstrike-ai/` заменяя изначальную версию
+Файл `hexstrike_mcp.py` копируем в папку HexStrike - `/usr/share/hexstrike-ai/` заменяя изначальную версию
 
 **Что было изменено:**
 
@@ -186,4 +186,3 @@ pgrep -c gunicorn
 | `batch_execute()` | Параллельное выполнение запросов |
 | `get_mcp_stats()` | Статистика кэша, rate limiter, запросов |
 | `clear_mcp_cache()` | Очистка локального MCP-кэша |
-
