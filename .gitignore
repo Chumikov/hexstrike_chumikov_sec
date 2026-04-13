@@ -1,0 +1,5 @@
+AGENTS.md
+hexstrike.log
+__pycache__/
+*.pyc
+.env
