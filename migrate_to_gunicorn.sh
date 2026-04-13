@@ -80,16 +80,43 @@ ok "Пользователь ${RUN_USER} существует"
 step "Установка Gunicorn"
 
 GUNICORN_PATH=""
+GUNICORN_WRAPPER=""
+
 if command -v gunicorn &>/dev/null; then
     GUNICORN_PATH=$(command -v gunicorn)
     ok "Gunicorn уже установлен: ${GUNICORN_PATH}"
 else
     info "Установка gunicorn..."
-    su - "$RUN_USER" -c "pip install gunicorn" 2>/dev/null || pip install gunicorn
+    apt-get install -y python3-gunicorn &>/dev/null || true
 
-    GUNICORN_PATH=$(su - "$RUN_USER" -c "which gunicorn" 2>/dev/null || which gunicorn)
+    for candidate in gunicorn gunicorn3; do
+        if command -v "$candidate" &>/dev/null; then
+            GUNICORN_PATH=$(command -v "$candidate")
+            break
+        fi
+    done
+
     if [[ -z "$GUNICORN_PATH" ]]; then
-        fail "Не удалось найти gunicorn после установки"
+        if python3 -c "import gunicorn" &>/dev/null; then
+            GUNICORN_WRAPPER="${HEXSTRIKE_DIR}/gunicorn.sh"
+            cat > "$GUNICORN_WRAPPER" << 'WRAPPER'
+#!/bin/bash
+exec python3 -m gunicorn "$@"
+WRAPPER
+            chmod +x "$GUNICORN_WRAPPER"
+            GUNICORN_PATH="$GUNICORN_WRAPPER"
+            ok "Gunicorn через python3 -m gunicorn (wrapper)"
+        else
+            info "Модуль не найден, ставим через pipx..."
+            apt-get install -y pipx &>/dev/null || true
+            if command -v pipx &>/dev/null; then
+                pipx install gunicorn &>/dev/null
+                GUNICORN_PATH=$(command -v gunicorn)
+            fi
+            if [[ -z "$GUNICORN_PATH" ]]; then
+                fail "Не удалось установить gunicorn ни одним способом"
+            fi
+        fi
     fi
     ok "Gunicorn установлен: ${GUNICORN_PATH}"
 fi
@@ -246,10 +273,4 @@ echo -e "${GREEN}│${NC}  Max Requests:${MAX_REQUESTS}"
 echo -e "${GREEN}│${NC}  Сервис:      ${SERVICE_FILE}"
 echo -e "${GREEN}│${NC}  Автозапуск:  ${BOOT_ENABLED}"
 echo -e "${GREEN}╰─────────────────────────────────────────────────────────────────╯${NC}"
-echo ""
-echo "  Управление сервисом:"
-echo "    sudo systemctl status hexstrike"
-echo "    sudo systemctl restart hexstrike"
-echo "    sudo systemctl stop hexstrike"
-echo "    journalctl -u hexstrike -f"
 echo ""
