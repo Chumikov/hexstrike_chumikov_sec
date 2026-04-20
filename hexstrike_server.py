@@ -9205,19 +9205,213 @@ def health_check():
         "additional": {"total": len(additional_tools), "available": sum(1 for tool in additional_tools if tools_status.get(tool, False))}
     }
 
-    return jsonify({
-        "status": "healthy",
-        "message": "HexStrike AI Tools API Server is operational",
-        "version": "6.0.0",
-        "tools_status": tools_status,
-        "all_essential_tools_available": all_essential_tools_available,
-        "total_tools_available": sum(1 for tool, available in tools_status.items() if available),
-        "total_tools_count": len(all_tools),
-        "category_stats": category_stats,
-        "cache_stats": cache.get_stats(),
-        "telemetry": telemetry.get_stats(),
-        "uptime": time.time() - telemetry.stats["start_time"]
-    })
+    total_available = sum(1 for tool, available in tools_status.items() if available)
+    uptime = time.time() - telemetry.stats["start_time"]
+    tel = telemetry.get_stats()
+    cs = cache.get_stats()
+
+    if request.args.get("json") is not None or request.headers.get("Accept") == "application/json":
+        return jsonify({
+            "status": "healthy",
+            "message": "HexStrike AI Tools API Server is operational",
+            "version": "6.0.0",
+            "tools_status": tools_status,
+            "all_essential_tools_available": all_essential_tools_available,
+            "total_tools_available": total_available,
+            "total_tools_count": len(all_tools),
+            "category_stats": category_stats,
+            "cache_stats": cs,
+            "telemetry": tel,
+            "uptime": uptime
+        })
+
+    def bar(pct, width=20):
+        filled = int(width * pct / 100)
+        return "\u2588" * filled + "\u2591" * (width - filled)
+
+    def fmt_bytes(b):
+        for u in ["B", "KB", "MB", "GB"]:
+            if b < 1024:
+                return f"{b:.1f} {u}"
+            b /= 1024
+        return f"{b:.1f} TB"
+
+    cat_display = {
+        "essential": ("Essential", essential_tools),
+        "network": ("Network", network_tools),
+        "web_security": ("Web Security", web_security_tools),
+        "vuln_scanning": ("Vuln Scanning", vuln_scanning_tools),
+        "password": ("Password", password_tools),
+        "binary": ("Binary / Pwn", binary_tools),
+        "forensics": ("Forensics", forensics_tools),
+        "cloud": ("Cloud", cloud_tools),
+        "osint": ("OSINT", osint_tools),
+        "exploitation": ("Exploitation", exploitation_tools),
+        "api": ("API", api_tools),
+        "wireless": ("Wireless", wireless_tools),
+        "additional": ("Additional", additional_tools),
+    }
+
+    sm = tel.get("system_metrics", {}) if isinstance(tel, dict) else {}
+    cpu = sm.get("cpu_percent", 0)
+    mem = sm.get("memory_percent", 0)
+    disk = sm.get("disk_usage", 0)
+    net = sm.get("network_io", {})
+    net_in = fmt_bytes(net.get("bytes_recv", 0))
+    net_out = fmt_bytes(net.get("bytes_sent", 0))
+
+    rows = ""
+    for cat_key, (cat_label, tool_list) in cat_display.items():
+        st = category_stats[cat_key]
+        avail = st["available"]
+        total = st["total"]
+        pct = int(100 * avail / total) if total else 0
+        color = "#00ff41" if pct == 100 else "#00cc33" if pct >= 75 else "#ffaa00" if pct >= 50 else "#ff3333"
+        rows += f'<tr><td>{cat_label}</td><td class="bar-cell"><span class="bar-fill" style="width:{pct}%;background:{color}"></span><span class="bar-text">{avail}/{total}</span></td><td style="color:{color}">{pct}%</td></tr>\n'
+
+    tools_html = ""
+    for cat_key, (cat_label, tool_list) in cat_display.items():
+        tools_html += f'<h3>{cat_label}</h3><div class="tool-grid">\n'
+        for t in tool_list:
+            installed = tools_status.get(t, False)
+            clean = t.rstrip("*")
+            is_info_only = t.endswith("*")
+            badge = '<span class="info-badge">INFO</span>' if is_info_only else ""
+            dot = '<span class="dot on"></span>' if installed else '<span class="dot off"></span>'
+            name_class = "tool-on" if installed else "tool-off"
+            item_class = "tool-item installed" if installed else "tool-item"
+            tools_html += f'<div class="{item_class}">{dot}<span class="{name_class}">{clean}</span>{badge}</div>\n'
+        tools_html += '</div>\n'
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HexStrike AI - System Status</title>
+<style>
+  :root {{
+    --bg: #0a0a0a;
+    --card: #111;
+    --border: #222;
+    --green: #00ff41;
+    --red: #ff3333;
+    --yellow: #ffaa00;
+    --dim: #999;
+    --text: #ccc;
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: 'Courier New', monospace; background: var(--bg); color: var(--text); padding: 20px; }}
+  .header {{ text-align: center; margin-bottom: 30px; border-bottom: 1px solid var(--border); padding-bottom: 20px; }}
+  .header h1 {{ color: var(--green); font-size: 28px; letter-spacing: 3px; text-shadow: 0 0 10px rgba(0,255,65,0.3); }}
+  .header .sub {{ color: var(--dim); font-size: 13px; margin-top: 5px; }}
+  .stats-row {{ display: flex; gap: 15px; margin-bottom: 25px; flex-wrap: wrap; }}
+  .stat-card {{ background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 15px 20px; flex: 1; min-width: 150px; }}
+  .stat-card .label {{ color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }}
+  .stat-card .value {{ color: var(--green); font-size: 24px; font-weight: bold; margin-top: 5px; }}
+  .stat-card.warn .value {{ color: var(--yellow); }}
+  .stat-card.danger .value {{ color: var(--red); }}
+  .section {{ background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 20px; margin-bottom: 20px; }}
+  .section h2 {{ color: var(--green); font-size: 16px; margin-bottom: 15px; letter-spacing: 2px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  td {{ padding: 6px 10px; border-bottom: 1px solid var(--border); }}
+  td:first-child {{ color: #aaa; width: 180px; }}
+  .bar-cell {{ position: relative; width: 300px; }}
+  .bar-fill {{ display: inline-block; height: 16px; border-radius: 3px; opacity: 0.3; }}
+  .bar-text {{ position: absolute; left: 10px; top: 7px; font-size: 11px; color: #fff; }}
+  .tool-grid {{ display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 15px; }}
+  .tool-item {{ display: flex; align-items: center; gap: 5px; background: #1a1a1a; border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-size: 12px; }}
+  .dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; }}
+  .dot.on {{ background: var(--green); box-shadow: 0 0 6px rgba(0,255,65,0.5); }}
+  .dot.off {{ background: #333; }}
+  .tool-on {{ color: var(--green); }}
+  .tool-off {{ color: #999; }}
+  .info-badge {{ background: #1a1a3a; color: #6666aa; font-size: 9px; padding: 1px 4px; border-radius: 3px; border: 1px solid #333366; }}
+  .filter-bar {{ margin-bottom: 15px; display: flex; gap: 8px; }}
+  .filter-btn {{ background: #1a1a1a; color: #aaa; border: 1px solid var(--border); border-radius: 4px; padding: 5px 12px; font-family: 'Courier New', monospace; font-size: 12px; cursor: pointer; }}
+  .filter-btn:hover {{ border-color: var(--green); color: var(--green); }}
+  .filter-btn.active {{ background: #1a2a1a; border-color: var(--green); color: var(--green); }}
+  .sys-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }}
+  .sys-item {{ background: #1a1a1a; border: 1px solid var(--border); border-radius: 4px; padding: 10px; }}
+  .sys-item .sys-label {{ color: var(--dim); font-size: 10px; text-transform: uppercase; }}
+  .sys-item .sys-value {{ font-size: 16px; margin-top: 3px; }}
+  .footer {{ text-align: center; color: #999; font-size: 11px; margin-top: 20px; }}
+  a {{ color: var(--green); text-decoration: none; }} a:hover {{ text-decoration: underline; }}
+  .blink {{ animation: blink 1s step-end infinite; }}
+  @keyframes blink {{ 50% {{ opacity: 0; }} }}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>&#9889; HEXSTRIKE AI<span class="blink">_</span></h1>
+  <div class="sub">v6.1 &middot; System Status &middot; Uptime: {uptime:.0f}s &middot; <a href="?json=1">JSON API</a></div>
+</div>
+
+<div class="stats-row">
+  <div class="stat-card"><div class="label">Tools Available</div><div class="value">{total_available}/{len(all_tools)}</div></div>
+  <div class="stat-card {"warn" if not all_essential_tools_available else ""}"><div class="label">Essential</div><div class="value">{"OK" if all_essential_tools_available else "MISSING"}</div></div>
+  <div class="stat-card {"danger" if cpu > 80 else "warn" if cpu > 60 else ""}"><div class="label">CPU</div><div class="value">{cpu:.1f}%</div></div>
+  <div class="stat-card {"danger" if mem > 90 else "warn" if mem > 70 else ""}"><div class="label">Memory</div><div class="value">{mem:.1f}%</div></div>
+  <div class="stat-card"><div class="label">Disk</div><div class="value">{disk:.1f}%</div></div>
+</div>
+
+<div class="section">
+  <h2>&#9632; CATEGORIES</h2>
+  <table>
+    <tr style="color:var(--dim);font-size:11px"><th style="text-align:left;font-weight:normal">Category</th><th style="text-align:left;font-weight:normal">Progress</th><th style="text-align:left;font-weight:normal">%</th></tr>
+    {rows}
+  </table>
+</div>
+
+<div class="section">
+  <h2>&#9632; TOOLS</h2>
+  <div class="filter-bar">
+    <button class="filter-btn active" onclick="filter('all')">All</button>
+    <button class="filter-btn" onclick="filter('missing')">&#10007; Missing Only</button>
+    <button class="filter-btn" onclick="filter('installed')">&#10003; Installed Only</button>
+  </div>
+  {tools_html}
+  <div style="margin-top:15px;color:#999;font-size:11px"><span class="info-badge">INFO</span> &mdash; instrument is not used by HexStrike-AI, shown for system info only</div>
+</div>
+
+<div class="section">
+  <h2>&#9632; SYSTEM</h2>
+  <div class="sys-grid">
+    <div class="sys-item"><div class="sys-label">Commands Executed</div><div class="sys-value" style="color:var(--green)">{tel.get("commands_executed", 0) if isinstance(tel, dict) else 0}</div></div>
+    <div class="sys-item"><div class="sys-label">Success Rate</div><div class="sys-value" style="color:var(--green)">{tel.get("success_rate", "N/A") if isinstance(tel, dict) else "N/A"}</div></div>
+    <div class="sys-item"><div class="sys-label">Avg Exec Time</div><div class="sys-value">{tel.get("average_execution_time", "N/A") if isinstance(tel, dict) else "N/A"}</div></div>
+    <div class="sys-item"><div class="sys-label">Cache Hit Rate</div><div class="sys-value">{cs.get("hit_rate", "N/A") if isinstance(cs, dict) else "N/A"}</div></div>
+    <div class="sys-item"><div class="sys-label">Cache Size</div><div class="sys-value">{cs.get("size", 0)}/{cs.get("max_size", 0) if isinstance(cs, dict) else 0}</div></div>
+    <div class="sys-item"><div class="sys-label">Network In</div><div class="sys-value">{net_in}</div></div>
+    <div class="sys-item"><div class="sys-label">Network Out</div><div class="sys-value">{net_out}</div></div>
+    <div class="sys-item"><div class="sys-label">Cache Evictions</div><div class="sys-value">{cs.get("evictions", 0) if isinstance(cs, dict) else 0}</div></div>
+  </div>
+</div>
+
+<div class="footer"><a href="https://github.com/Chumikov/hexstrike_chumikov_sec" target="_blank">HexStrike AI v6.1 &middot; Chumikov Sec</a></div>
+<script>
+function filter(mode) {{
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+  document.querySelectorAll('.tool-item').forEach(item => {{
+    const isInstalled = item.classList.contains('installed');
+    if (mode === 'all') {{ item.style.display = ''; }}
+    else if (mode === 'missing') {{ item.style.display = isInstalled ? 'none' : ''; }}
+    else if (mode === 'installed') {{ item.style.display = isInstalled ? '' : 'none'; }}
+  }});
+  document.querySelectorAll('h3').forEach(h3 => {{
+    const grid = h3.nextElementSibling;
+    if (grid && grid.classList.contains('tool-grid')) {{
+      const visible = grid.querySelectorAll('.tool-item:not([style*="display: none"])');
+      h3.style.display = visible.length === 0 ? 'none' : '';
+      grid.style.display = visible.length === 0 ? 'none' : '';
+    }}
+  }});
+}}
+</script>
+</body>
+</html>"""
+    return html
 
 @app.route("/api/command", methods=["POST"])
 def generic_command():
