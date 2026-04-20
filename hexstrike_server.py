@@ -9122,22 +9122,22 @@ def health_check():
     ]
 
     vuln_scanning_tools = [
-        "nuclei", "wpscan", "graphql-scanner", "jwt-analyzer"
+        "nuclei", "wpscan", "graphql-scanner*", "jwt-analyzer*"
     ]
 
     password_tools = [
-        "medusa", "patator", "hash-identifier", "ophcrack", "hashcat-utils"
+        "medusa", "patator", "hash-identifier", "ophcrack", "hashcat-utils*"
     ]
 
     binary_tools = [
-        "gdb", "radare2", "binwalk", "ropgadget", "checksec", "objdump",
+        "gdb", "radare2", "binwalk", "ROPgadget", "checksec", "objdump",
         "ghidra", "pwntools", "one-gadget", "ropper", "angr", "libc-database",
         "pwninit"
     ]
 
     forensics_tools = [
-        "volatility3", "vol", "steghide", "hashpump", "foremost", "exiftool",
-        "strings", "xxd", "file", "photorec", "testdisk", "scalpel", "bulk-extractor",
+        "volatility3", "vol*", "steghide", "hashpump", "foremost", "exiftool",
+        "strings", "xxd", "file", "photorec", "testdisk", "scalpel", "bulk_extractor",
         "stegsolve", "zsteg", "outguess"
     ]
 
@@ -9148,28 +9148,30 @@ def health_check():
 
     osint_tools = [
         "amass", "subfinder", "fierce", "dnsenum", "theharvester", "sherlock",
-        "social-analyzer", "recon-ng", "maltego", "spiderfoot", "shodan-cli",
-        "censys-cli", "have-i-been-pwned"
+        "social-analyzer", "recon-ng", "maltego", "spiderfoot", "shodan",
+        "censys", "have-i-been-pwned*"
     ]
 
     exploitation_tools = [
-        "metasploit", "exploit-db", "searchsploit"
+        "metasploit", "searchsploit*"
     ]
 
     api_tools = [
-        "api-schema-analyzer", "postman", "insomnia", "curl", "httpie", "anew", "qsreplace", "uro"
+        "api-schema-analyzer*", "postman", "insomnia*", "curl", "httpie*", "anew", "qsreplace", "uro"
     ]
 
     wireless_tools = [
-        "kismet", "wireshark", "tshark", "tcpdump"
+        "kismet*", "wireshark", "tshark", "tcpdump"
     ]
 
     additional_tools = [
-        "smbmap", "volatility", "sleuthkit", "autopsy", "evil-winrm",
-        "paramspider", "airmon-ng", "airodump-ng", "aireplay-ng", "aircrack-ng",
-        "msfvenom", "msfconsole", "graphql-scanner", "jwt-analyzer"
+        "smbmap", "volatility", "sleuthkit", "autopsy", "evil-winrm*",
+        "paramspider", "airmon-ng*", "airodump-ng*", "aireplay-ng*", "aircrack-ng*",
+        "msfvenom", "msfconsole", "graphql-scanner*", "jwt-analyzer*"
     ]
 
+    # * — инструмент не используется в работе HexStrike-AI,
+    # отображается только для информации о наличии в системе
     all_tools = (
         essential_tools + network_tools + web_security_tools + vuln_scanning_tools +
         password_tools + binary_tools + forensics_tools + cloud_tools +
@@ -9179,7 +9181,8 @@ def health_check():
 
     for tool in all_tools:
         try:
-            result = execute_command(f"which {tool}", use_cache=True)
+            clean_name = tool.rstrip("*")
+            result = execute_command(f"which {clean_name}", use_cache=True)
             tools_status[tool] = result["success"]
         except:
             tools_status[tool] = False
