@@ -154,7 +154,7 @@ fi
 step "Создание systemd unit"
 
 USER_LOCAL_BIN=$(dirname "$GUNICORN_PATH")
-SYSTEMD_PATH="PATH=${USER_LOCAL_BIN}:/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin:/home/${RUN_USER}/go/bin:/home/${RUN_USER}/.local/bin"
+SYSTEMD_PATH="PATH=${USER_LOCAL_BIN}:/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin:/home/${RUN_USER}/go/bin:/home/${RUN_USER}/.local/bin:/home/${RUN_USER}/.cargo/bin"
 
 cat > "$SERVICE_FILE" << EOF
 [Unit]
