@@ -18,9 +18,10 @@ HEXSTRIKE_PORT=8888
 WORKERS=2
 TIMEOUT=300
 MAX_REQUESTS=1000
+VENV_DIR="${HEXSTRIKE_DIR}/venv"
 
 STEP=0
-STEPS_TOTAL=8
+STEPS_TOTAL=10
 
 step() {
     STEP=$((STEP + 1))
@@ -52,7 +53,7 @@ echo -e "${RED}██╔══██║██╔══╝   ██╔██╗ �
 echo -e "${RED}██║  ██║███████╗██╔╝ ██╗███████║   ██║   ██║  ██║██║██║  ██╗███████╗${NC}"
 echo -e "${RED}╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚══════╝${NC}"
 echo ""
-echo "  Миграция HexStrike AI на Gunicorn"
+echo "  Миграция HexStrike AI на Gunicorn + venv"
 echo ""
 
 check_root
@@ -66,7 +67,7 @@ info "Пользователь службы: ${RUN_USER}"
 step "Проверка окружения"
 
 if [[ ! -f "${HEXSTRIKE_DIR}/hexstrike_server.py" ]]; then
-    fail "hexstrike_server.py не найден в ${HEXSTRIKE_DIR}"
+    fail "hexstrike_server.py не найден в ${HEXSTRIKE_DIR}. Установите hexstrike-ai: sudo apt install hexstrike-ai"
 fi
 ok "hexstrike_server.py найден"
 
@@ -75,67 +76,114 @@ if ! id "$RUN_USER" &>/dev/null; then
 fi
 ok "Пользователь ${RUN_USER} существует"
 
+PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+PYTHON_OK=$(python3 -c "import sys; ok = sys.version_info >= (3, 10); print(ok)")
+if [[ "$PYTHON_OK" != "True" ]]; then
+    fail "Требуется Python >= 3.10, установлена ${PYTHON_VERSION}"
+fi
+ok "Python ${PYTHON_VERSION} (>= 3.10)"
+
+if ! curl -sf https://pypi.org/simple/ >/dev/null 2>&1 && ! curl -sf https://pypi.python.org/simple/ >/dev/null 2>&1; then
+    warn "PyPI недоступен — pip install может не сработать"
+    warn "Убедитесь, что есть доступ к интернету"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ============================================================================
+
+step "Копирование файлов проекта"
+
+cp "${SCRIPT_DIR}/hexstrike_server.py" "${HEXSTRIKE_DIR}/hexstrike_server.py"
+ok "hexstrike_server.py скопирован"
+
+cp "${SCRIPT_DIR}/hexstrike_mcp.py" "${HEXSTRIKE_DIR}/hexstrike_mcp.py"
+ok "hexstrike_mcp.py скопирован"
+
 if [[ -d "${SCRIPT_DIR}/templates" ]]; then
     mkdir -p "${HEXSTRIKE_DIR}/templates"
     cp -a "${SCRIPT_DIR}/templates/." "${HEXSTRIKE_DIR}/templates/"
-    ok "Шаблоны скопированы в ${HEXSTRIKE_DIR}/templates/"
+    ok "templates/ скопирован"
 else
-    warn "Директория templates/ не найдена рядом со скриптом, пропускаем"
+    warn "Директория templates/ не найдена, пропускаем"
 fi
 
 if [[ -f "${SCRIPT_DIR}/VERSION" ]]; then
     cp "${SCRIPT_DIR}/VERSION" "${HEXSTRIKE_DIR}/VERSION"
-    ok "VERSION скопирован в ${HEXSTRIKE_DIR}/VERSION ($(cat ${SCRIPT_DIR}/VERSION))"
+    ok "VERSION скопирован ($(cat ${SCRIPT_DIR}/VERSION))"
 else
-    warn "Файл VERSION не найден рядом со скриптом, пропускаем"
+    warn "Файл VERSION не найден, пропускаем"
 fi
+
+if [[ -f "${SCRIPT_DIR}/requirements.txt" ]]; then
+    cp "${SCRIPT_DIR}/requirements.txt" "${HEXSTRIKE_DIR}/requirements.txt"
+    ok "requirements.txt скопирован"
+else
+    fail "Файл requirements.txt не найден в ${SCRIPT_DIR}"
+fi
+
+cp "${SCRIPT_DIR}/OpenCodeStart.sh" "${HEXSTRIKE_DIR}/OpenCodeStart.sh"
+chmod +x "${HEXSTRIKE_DIR}/OpenCodeStart.sh"
+ok "OpenCodeStart.sh скопирован"
 
 # ============================================================================
 
-step "Установка Gunicorn"
+step "Создание виртуального окружения"
 
-GUNICORN_PATH=""
-GUNICORN_WRAPPER=""
-
-if command -v gunicorn &>/dev/null; then
-    GUNICORN_PATH=$(command -v gunicorn)
-    ok "Gunicorn уже установлен: ${GUNICORN_PATH}"
-else
-    info "Установка gunicorn..."
-    apt-get install -y python3-gunicorn &>/dev/null || true
-
-    for candidate in gunicorn gunicorn3; do
-        if command -v "$candidate" &>/dev/null; then
-            GUNICORN_PATH=$(command -v "$candidate")
-            break
-        fi
-    done
-
-    if [[ -z "$GUNICORN_PATH" ]]; then
-        if python3 -c "import gunicorn" &>/dev/null; then
-            GUNICORN_WRAPPER="${HEXSTRIKE_DIR}/gunicorn.sh"
-            cat > "$GUNICORN_WRAPPER" << 'WRAPPER'
-#!/bin/bash
-exec python3 -m gunicorn "$@"
-WRAPPER
-            chmod +x "$GUNICORN_WRAPPER"
-            GUNICORN_PATH="$GUNICORN_WRAPPER"
-            ok "Gunicorn через python3 -m gunicorn (wrapper)"
-        else
-            info "Модуль не найден, ставим через pipx..."
-            apt-get install -y pipx &>/dev/null || true
-            if command -v pipx &>/dev/null; then
-                pipx install gunicorn &>/dev/null
-                GUNICORN_PATH=$(command -v gunicorn)
-            fi
-            if [[ -z "$GUNICORN_PATH" ]]; then
-                fail "Не удалось установить gunicorn ни одним способом"
-            fi
-        fi
-    fi
-    ok "Gunicorn установлен: ${GUNICORN_PATH}"
+if [[ -d "${VENV_DIR}" ]]; then
+    info "venv уже существует, пересоздаём для чистоты..."
+    rm -rf "${VENV_DIR}"
 fi
+
+python3 -m venv --system-site-packages "${VENV_DIR}"
+ok "venv создан в ${VENV_DIR}"
+
+chown -R "${RUN_USER}:${RUN_GROUP}" "${VENV_DIR}"
+ok "Владелец venv: ${RUN_USER}:${RUN_GROUP}"
+
+VENV_PYTHON="${VENV_DIR}/bin/python3"
+VENV_PIP="${VENV_DIR}/bin/pip"
+
+if [[ ! -x "$VENV_PYTHON" ]]; then
+    fail "python3 не найден в venv"
+fi
+ok "Python venv: ${VENV_PYTHON}"
+
+SYSTEM_PKGS=$(${VENV_PIP} list --format=columns 2>/dev/null | wc -l)
+info "Системных пакетов доступно через --system-site-packages"
+
+# ============================================================================
+
+step "Установка зависимостей"
+
+info "Установка из requirements.txt..."
+if ! ${VENV_PIP} install -r "${HEXSTRIKE_DIR}/requirements.txt" 2>&1; then
+    fail "pip install завершился с ошибкой. Проверьте доступ к PyPI и совместимость пакетов."
+fi
+ok "Зависимости установлены"
+
+INSTALLED_VERSION=$(${VENV_PIP} show flask 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "unknown")
+info "flask: ${INSTALLED_VERSION}"
+INSTALLED_VERSION=$(${VENV_PIP} show mcp 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "unknown")
+info "mcp: ${INSTALLED_VERSION}"
+INSTALLED_VERSION=$(${VENV_PIP} show gunicorn 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "unknown")
+info "gunicorn: ${INSTALLED_VERSION}"
+
+chown -R "${RUN_USER}:${RUN_GROUP}" "${VENV_DIR}"
+
+# ============================================================================
+
+step "Создание gunicorn wrapper"
+
+GUNICORN_WRAPPER="${HEXSTRIKE_DIR}/gunicorn.sh"
+cat > "$GUNICORN_WRAPPER" << WRAPPER
+#!/bin/bash
+exec ${VENV_DIR}/bin/python3 -m gunicorn "\$@"
+WRAPPER
+chmod +x "$GUNICORN_WRAPPER"
+chown "${RUN_USER}:${RUN_GROUP}" "$GUNICORN_WRAPPER"
+ok "gunicorn.sh создан: ${GUNICORN_WRAPPER}"
+ok "Использует venv python: ${VENV_DIR}/bin/python3"
 
 # ============================================================================
 
@@ -169,8 +217,8 @@ fi
 
 step "Создание systemd unit"
 
-USER_LOCAL_BIN=$(dirname "$GUNICORN_PATH")
-SYSTEMD_PATH="PATH=${USER_LOCAL_BIN}:/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin:/home/${RUN_USER}/go/bin:/home/${RUN_USER}/.local/bin:/home/${RUN_USER}/.cargo/bin"
+VENV_BIN="${VENV_DIR}/bin"
+SYSTEMD_PATH="PATH=${VENV_BIN}:/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin:/home/${RUN_USER}/go/bin:/home/${RUN_USER}/.local/bin:/home/${RUN_USER}/.cargo/bin"
 
 cat > "$SERVICE_FILE" << EOF
 [Unit]
@@ -183,7 +231,7 @@ User=${RUN_USER}
 Group=${RUN_GROUP}
 WorkingDirectory=${HEXSTRIKE_DIR}
 Environment="${SYSTEMD_PATH}"
-ExecStart=${GUNICORN_PATH} --bind 127.0.0.1:${HEXSTRIKE_PORT} --workers ${WORKERS} --timeout ${TIMEOUT} --max-requests ${MAX_REQUESTS} hexstrike_server:app
+ExecStart=${GUNICORN_WRAPPER} --bind 127.0.0.1:${HEXSTRIKE_PORT} --workers ${WORKERS} --timeout ${TIMEOUT} --max-requests ${MAX_REQUESTS} hexstrike_server:app
 ExecReload=/bin/kill -s HUP \$MAINPID
 Restart=on-failure
 RestartSec=5
@@ -251,7 +299,7 @@ else
     fail "Статус сервиса: ${SERVICE_STATUS}"
 fi
 
-HEALTH_JSON=$(curl -sf "http://127.0.0.1:${HEXSTRIKE_PORT}/health" 2>/dev/null || echo "{}")
+HEALTH_JSON=$(curl -sf "http://127.0.0.1:${HEXSTRIKE_PORT}/health?json" 2>/dev/null || echo "{}")
 STATUS_IN_JSON=$(echo "$HEALTH_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null || echo "unknown")
 
 if [[ "$STATUS_IN_JSON" == "healthy" || "$STATUS_IN_JSON" == "ok" ]]; then
@@ -259,6 +307,12 @@ if [[ "$STATUS_IN_JSON" == "healthy" || "$STATUS_IN_JSON" == "ok" ]]; then
 else
     warn "Health check вернул: ${STATUS_IN_JSON}"
 fi
+
+SERVER_VERSION=$(echo "$HEALTH_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('version','unknown'))" 2>/dev/null || echo "unknown")
+ok "Версия сервера: ${SERVER_VERSION}"
+
+TOOLS_AVAILABLE=$(echo "$HEALTH_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d.get(\"total_tools_available\",0)}/{d.get(\"total_tools_count\",0)}')" 2>/dev/null || echo "unknown")
+ok "Инструменты: ${TOOLS_AVAILABLE}"
 
 GUNICORN_RUNNING=$(pgrep -c gunicorn 2>/dev/null || echo "0")
 ok "Gunicorn worker'ов запущено: ${GUNICORN_RUNNING}"
@@ -273,15 +327,22 @@ fi
 BOOT_ENABLED=$(systemctl is-enabled hexstrike 2>/dev/null || echo "unknown")
 ok "Автозапуск: ${BOOT_ENABLED}"
 
+VENV_PYTHON_VERSION=$(${VENV_PYTHON} --version 2>/dev/null || echo "unknown")
+ok "venv Python: ${VENV_PYTHON_VERSION}"
+
+VENV_FLASK=$(${VENV_PIP} show flask 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "unknown")
+ok "venv flask: ${VENV_FLASK}"
+
 # ============================================================================
 
 step "Итог"
 
 echo ""
 echo -e "${GREEN}╭─────────────────────────────────────────────────────────────────╮${NC}"
-echo -e "${GREEN}│  Миграция на Gunicorn завершена успешно                        │${NC}"
+echo -e "${GREEN}│  Миграция на Gunicorn + venv завершена успешно                 │${NC}"
 echo -e "${GREEN}├─────────────────────────────────────────────────────────────────┤${NC}"
-echo -e "${GREEN}│${NC}  Gunicorn:    ${GUNICORN_PATH}"
+echo -e "${GREEN}│${NC}  Gunicorn:    ${GUNICORN_WRAPPER}"
+echo -e "${GREEN}│${NC}  venv:        ${VENV_DIR}"
 echo -e "${GREEN}│${NC}  Порт:        127.0.0.1:${HEXSTRIKE_PORT}"
 echo -e "${GREEN}│${NC}  Workers:     ${WORKERS}"
 echo -e "${GREEN}│${NC}  Timeout:     ${TIMEOUT}s"
