@@ -91,6 +91,13 @@ except PermissionError:
     )
 logger = logging.getLogger(__name__)
 
+def get_version() -> str:
+    try:
+        version_file = Path(__file__).resolve().parent / "VERSION"
+        return version_file.read_text().strip()
+    except Exception:
+        return "unknown"
+
 # Flask app configuration
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
@@ -9214,7 +9221,7 @@ def health_check():
         return jsonify({
             "status": "healthy",
             "message": "HexStrike AI Tools API Server is operational",
-            "version": "6.0.0",
+            "version": get_version(),
             "tools_status": tools_status,
             "all_essential_tools_available": all_essential_tools_available,
             "total_tools_available": total_available,

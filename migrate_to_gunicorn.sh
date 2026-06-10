@@ -84,6 +84,13 @@ else
     warn "Директория templates/ не найдена рядом со скриптом, пропускаем"
 fi
 
+if [[ -f "${SCRIPT_DIR}/VERSION" ]]; then
+    cp "${SCRIPT_DIR}/VERSION" "${HEXSTRIKE_DIR}/VERSION"
+    ok "VERSION скопирован в ${HEXSTRIKE_DIR}/VERSION ($(cat ${SCRIPT_DIR}/VERSION))"
+else
+    warn "Файл VERSION не найден рядом со скриптом, пропускаем"
+fi
+
 # ============================================================================
 
 step "Установка Gunicorn"

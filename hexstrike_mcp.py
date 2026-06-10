@@ -34,6 +34,14 @@ import traceback
 import aiohttp
 import requests
 from mcp.server.fastmcp import FastMCP
+from pathlib import Path
+
+def get_version() -> str:
+    try:
+        version_file = Path(__file__).resolve().parent / "VERSION"
+        return version_file.read_text().strip()
+    except Exception:
+        return "unknown"
 
 class ErrorCategory(Enum):
     NETWORK = "network"
