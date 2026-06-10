@@ -1,32 +1,70 @@
-# Предисловие
+# HexStrike AI — Chumikov Sec Fork
 
 В своей статье https://habr.com/ru/articles/985450/ я рассмотрел интеграцию Hexstrike-AI и OpenCode в Kali Linux. С того времени вышло очень много обновлений OpenCode и всего 2 или 3 патча безопасности для HexStrike. При этом, работа указанной связки была крайне нестабильной и местами крайне медленной. Ждать обещанную 7 версию Hexstrike я не стал и решил внести несколько правок в Hexstrike и неформально получить собственную версию 6.1 данного решения.
 
 Тут я делюсь с вами своими исправлениями и улучшениями. Планирую развивать данный репо вплоть до выхода Hexstrike 7.0.
 
-Далее преполагается, что HexStrike и OpenCode у вас уже установлены (читайте мою статью).
-
-Клонируйте данный репо себе (клонирование сохраняет нужные права для файлов) и следуйте инструкции ниже. Если останутся вопросы, спрашивайте. Ну и кончено же,предлагайте свои фиксы и правки!
+Далее предполагается, что HexStrike и OpenCode у вас уже установлены (читайте мою статью).
 
 ---
 
 # Содержание
 
-1. [Первый шаг](#первый-шаг)
-2. [Миграция на Gunicorn](#миграция-на-gunicorn)
-3. [Настройка автозапуска и OpenCode](#настройка-автозапуска-и-opencode)
-4. [Изменения в hexstrike_server.py](#изменения-в-hexstrike_serverpy)
-5. [Изменения в hexstrike_mcp.py](#изменения-в-hexstrike_mcpy)
+1. [Установка и обновление](#установка-и-обновление)
+2. [Структура проекта](#структура-проекта)
+3. [Миграция на Gunicorn](#миграция-на-gunicorn)
+4. [Панель мониторинга](#панель-мониторинга)
+5. [Настройка автозапуска и OpenCode](#настройка-автозапуска-и-opencode)
+6. [Версионность](#версионность)
+7. [Изменения в hexstrike_server.py](#изменения-в-hexstrike_serverpy)
+8. [Изменения в hexstrike_mcp.py](#изменения-в-hexstrike_mcpy)
 
 ---
 
-## Первый шаг
+## Установка и обновление
 
-На всякий случай, проверьте корректность установки всех зависимостей Hexstrike командой:
+### Требования
+
+- Kali Linux
+- Установленный пакет `hexstrike-ai` (`sudo apt install hexstrike-ai`)
+
+### Первая установка
 
 ```bash
-sudo apt install -f hexstrike-ai
+sudo apt install hexstrike-ai
+git clone https://github.com/Chumikov/hexstrike_chumikov_sec.git
+cd hexstrike_chumikov_sec
+sudo bash migrate_to_gunicorn.sh
 ```
+
+### Обновление до новой версии
+
+```bash
+cd hexstrike_chumikov_sec
+git pull
+sudo bash migrate_to_gunicorn.sh
+```
+
+### Проверка
+
+```bash
+systemctl status hexstrike
+curl http://127.0.0.1:8888/health
+```
+
+---
+
+## Структура проекта
+
+| Файл | Назначение |
+|---|---|
+| `VERSION` | Версия проекта (SemVer), единый source of truth |
+| `CHANGELOG.md` | История релизов |
+| `hexstrike_server.py` | Flask REST API сервер — 156+ маршрутов, обёртки над security-инструментами |
+| `hexstrike_mcp.py` | MCP-клиент на FastMCP — мост между AI-агентами и сервером |
+| `migrate_to_gunicorn.sh` | Миграция на Gunicorn + генерация systemd unit + деплой всех файлов |
+| `OpenCodeStart.sh` | Автозапуск сервера + MCP-клиента для OpenCode |
+| `templates/health_panel.html` | Шаблон HTML-панели мониторинга |
 
 ---
 
@@ -46,20 +84,20 @@ sudo apt install -f hexstrike-ai
 
 ### Скрипт миграции
 
-`migrate_to_gunicorn.sh` выполняет 8 шагов:
+`migrate_to_gunicorn.sh` выполняет все шаги автоматически:
 
-1. Проверка root-прав и наличия `hexstrike_server.py`
-2. Установка Gunicorn через pip (если не установлен)
-3. Автоопределение пути к `gunicorn`
+1. Проверка root-прав и наличия `hexstrike-ai`
+2. Копирование всех файлов проекта (`hexstrike_server.py`, `hexstrike_mcp.py`, `templates/`, `VERSION`)
+3. Установка Gunicorn (если не установлен)
 4. Освобождение порта 8888 (остановка старого процесса)
-5. Генерация systemd unit с корректными путями
+5. Генерация systemd unit с корректными путями (включая `~/.cargo/bin` для rustscan)
 6. `daemon-reload` + `enable` + `start`
 7. Ожидание health-check (до 30 сек)
 8. Финальная проверка: статус, health, workers, порт, автозапуск
 
 При ошибке на любом этапе — выводит `systemctl status` и `journalctl` и останавливается.
 
-#### Запуск скрипта миграции
+#### Запуск
 
 ```bash
 sudo bash migrate_to_gunicorn.sh
@@ -72,22 +110,25 @@ systemctl status hexstrike
 curl http://127.0.0.1:8888/health
 pgrep -c gunicorn
 ```
+
+---
+
+## Панель мониторинга
+
+Health endpoint (`/health`) теперь отдаёт визуальную HTML-панель вместо голого JSON.
+
+- **`/health`** — HTML-панель с тёмным дизайном: прогресс-бары по категориям инструментов, сетка статуса (установлен/отсутствует), системные метрики (CPU, RAM, Disk, Network)
+- **`/health?json`** или **`Accept: application/json`** — JSON-ответ для API
+
+Инструменты, которые отображаются только для информации о наличии в системе (не используются HexStrike напрямую), помечены значком `INFO`.
+
 ---
 
 ## Настройка автозапуска и OpenCode
 
-### Скрипт автозапуска
-
-Файл `OpenCodeStart.sh` копируем в папку HexStrike - `/usr/share/hexstrike-ai/`
-
-Скрипт автоматически:
-1. Проверяет доступность сервера на `http://127.0.0.1:8888/health`
-2. Запускает Gunicorn через systemd или вручную, если сервер не отвечает
-3. Ожидает 2 секунды для инициализации и запускает MCP клиент
-
 ### Конфигурация MCP OpenCode
 
-Необходимо внести изменения в файл конфигурации MCP OpenCode, чтобы запуск использовал наш скрипт автозапуска:
+Необходимо внести изменения в файл конфигурации MCP OpenCode, чтобы запуск использовал скрипт автозапуска:
 
 Файл: `/home/kali/.opencode/opencode.jsonc`
 
@@ -96,11 +137,11 @@ pgrep -c gunicorn
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  
+
   "experimental": {
     "mcp_timeout": 1200000
   },
-  
+
   "mcp": {
     "hexstrike": {
       "type": "local",
@@ -114,11 +155,25 @@ pgrep -c gunicorn
 
 ---
 
+## Версионность
+
+Начиная с v6.1.1, проект использует [SemVer](https://semver.org/lang/ru/):
+
+- `VERSION` — единый файл с версией, читается сервером и MCP-клиентом
+- `CHANGELOG.md` — история релизов
+- Git-теги формата `vX.Y.Z` соответствуют релизам на GitHub
+
+Текущую версию можно узнать через health endpoint:
+
+```bash
+curl -s http://127.0.0.1:8888/health?json | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])"
+```
+
+---
+
 ## Изменения в hexstrike_server.py
 
-Файл `hexstrike_server.py` копируем в папку HexStrike - `/usr/share/hexstrike-ai/` заменяя изначальную версию
-
-**Что было изменено:**
+Изменения развёртываются автоматически скриптом `migrate_to_gunicorn.sh`.
 
 ### Безопасность
 
@@ -137,9 +192,7 @@ pgrep -c gunicorn
 
 ## Изменения в hexstrike_mcp.py
 
-Файл `hexstrike_mcp.py` копируем в папку HexStrike - `/usr/share/hexstrike-ai/` заменяя изначальную версию
-
-**Что было изменено:**
+Изменения развёртываются автоматически скриптом `migrate_to_gunicorn.sh`.
 
 ### Асинхронные запросы
 
