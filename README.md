@@ -34,7 +34,7 @@
 sudo apt install hexstrike-ai
 git clone https://github.com/Chumikov/hexstrike_chumikov_sec.git
 cd hexstrike_chumikov_sec
-sudo bash migrate_to_gunicorn.sh
+sudo bash deploy.sh
 ```
 
 ### Обновление до новой версии
@@ -42,7 +42,7 @@ sudo bash migrate_to_gunicorn.sh
 ```bash
 cd hexstrike_chumikov_sec
 git pull
-sudo bash migrate_to_gunicorn.sh
+sudo bash deploy.sh
 ```
 
 ### Проверка
@@ -62,7 +62,7 @@ curl http://127.0.0.1:8888/health
 | `CHANGELOG.md` | История релизов |
 | `hexstrike_server.py` | Flask REST API сервер — 156+ маршрутов, обёртки над security-инструментами |
 | `hexstrike_mcp.py` | MCP-клиент на FastMCP — мост между AI-агентами и сервером |
-| `migrate_to_gunicorn.sh` | Миграция на Gunicorn + генерация systemd unit + деплой всех файлов |
+| `deploy.sh` | Полный деплой: venv, зависимости, systemd, проверка |
 | `OpenCodeStart.sh` | Автозапуск сервера + MCP-клиента для OpenCode |
 | `templates/health_panel.html` | Шаблон HTML-панели мониторинга |
 
@@ -84,23 +84,22 @@ curl http://127.0.0.1:8888/health
 
 ### Скрипт миграции
 
-`migrate_to_gunicorn.sh` выполняет все шаги автоматически:
+`deploy.sh` выполняет все шаги автоматически:
 
-1. Проверка root-прав и наличия `hexstrike-ai`
-2. Копирование всех файлов проекта (`hexstrike_server.py`, `hexstrike_mcp.py`, `templates/`, `VERSION`)
-3. Установка Gunicorn (если не установлен)
-4. Освобождение порта 8888 (остановка старого процесса)
-5. Генерация systemd unit с корректными путями (включая `~/.cargo/bin` для rustscan)
-6. `daemon-reload` + `enable` + `start`
-7. Ожидание health-check (до 30 сек)
-8. Финальная проверка: статус, health, workers, порт, автозапуск
+1. Проверка root-прав и наличия `hexstrike-ai`, Python >= 3.10
+2. Копирование всех файлов проекта (`hexstrike_server.py`, `hexstrike_mcp.py`, `templates/`, `VERSION`, `requirements.txt`)
+3. Создание venv с `--system-site-packages` и установка зависимостей через pip
+4. Генерация gunicorn wrapper и systemd unit (включая `~/.cargo/bin` для rustscan)
+5. `daemon-reload` + `enable` + `start`
+6. Ожидание health-check (до 30 сек)
+7. Финальная проверка: статус, версия, инструменты, venv
 
 При ошибке на любом этапе — выводит `systemctl status` и `journalctl` и останавливается.
 
 #### Запуск
 
 ```bash
-sudo bash migrate_to_gunicorn.sh
+sudo bash deploy.sh
 ```
 
 #### Ручная проверка после миграции
@@ -173,7 +172,7 @@ curl -s http://127.0.0.1:8888/health?json | python3 -c "import sys,json; print(j
 
 ## Изменения в hexstrike_server.py
 
-Изменения развёртываются автоматически скриптом `migrate_to_gunicorn.sh`.
+Изменения развёртываются автоматически скриптом `deploy.sh`.
 
 ### Безопасность
 
@@ -192,7 +191,7 @@ curl -s http://127.0.0.1:8888/health?json | python3 -c "import sys,json; print(j
 
 ## Изменения в hexstrike_mcp.py
 
-Изменения развёртываются автоматически скриптом `migrate_to_gunicorn.sh`.
+Изменения развёртываются автоматически скриптом `deploy.sh`.
 
 ### Асинхронные запросы
 
