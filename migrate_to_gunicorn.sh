@@ -75,6 +75,15 @@ if ! id "$RUN_USER" &>/dev/null; then
 fi
 ok "Пользователь ${RUN_USER} существует"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d "${SCRIPT_DIR}/templates" ]]; then
+    mkdir -p "${HEXSTRIKE_DIR}/templates"
+    cp -a "${SCRIPT_DIR}/templates/." "${HEXSTRIKE_DIR}/templates/"
+    ok "Шаблоны скопированы в ${HEXSTRIKE_DIR}/templates/"
+else
+    warn "Директория templates/ не найдена рядом со скриптом, пропускаем"
+fi
+
 # ============================================================================
 
 step "Установка Gunicorn"
