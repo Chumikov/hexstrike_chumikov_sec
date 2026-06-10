@@ -83,7 +83,7 @@ if [[ "$PYTHON_OK" != "True" ]]; then
 fi
 ok "Python ${PYTHON_VERSION} (>= 3.10)"
 
-if ! curl -sf https://pypi.org/simple/ >/dev/null 2>&1 && ! curl -sf https://pypi.python.org/simple/ >/dev/null 2>&1; then
+if ! curl -sf --connect-timeout 5 --max-time 10 https://pypi.python.org/simple/ >/dev/null 2>&1; then
     warn "PyPI недоступен — pip install может не сработать"
     warn "Убедитесь, что есть доступ к интернету"
 fi
