@@ -59,7 +59,7 @@
 <body>
 <div class="header">
   <h1>&#9889; HEXSTRIKE AI<span class="blink">_</span></h1>
-  <div class="sub">v6.1 &middot; System Status &middot; Uptime: {{ uptime }}s &middot; <a href="?json=1">JSON API</a></div>
+  <div class="sub">v{{ version }} &middot; System Status &middot; Uptime: {{ uptime }}s &middot; <a href="?json=1">JSON API</a></div>
 </div>
 
 <div class="stats-row">
@@ -105,7 +105,7 @@
   </div>
 </div>
 
-<div class="footer"><a href="https://github.com/Chumikov/hexstrike_chumikov_sec" target="_blank">HexStrike AI v6.1 &middot; Chumikov Sec</a></div>
+<div class="footer"><a href="https://github.com/Chumikov/hexstrike_chumikov_sec" target="_blank">HexStrike AI v{{ version }} &middot; Chumikov Sec</a></div>
 <script>
 function filter(mode) {
   document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));

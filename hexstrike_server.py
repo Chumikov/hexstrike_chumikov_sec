@@ -9292,6 +9292,7 @@ def health_check():
         tools_html += '</div>\n'
 
     return render_template("health_panel.html",
+        version=get_version(),
         uptime=f"{uptime:.0f}",
         total_available=total_available,
         total_tools=len(all_tools),
