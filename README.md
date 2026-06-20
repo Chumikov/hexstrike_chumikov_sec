@@ -246,6 +246,56 @@ curl -s http://127.0.0.1:8888/health?json | python3 -c "import sys,json; print(j
 
 ---
 
+## Транспорт и оптимизация (v6.3.0)
+
+### MCP-транспорт
+
+По умолчанию HexStrike MCP работает через **stdio**: OpenCode порождает процесс
+`OpenCodeStart.sh` и общается по stdin/stdout. При длительных сканах (60+ c)
+используйте streamable-http/sse — соединение не рвётся.
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `MCP_TRANSPORT` | `stdio` | `stdio` \| `sse` \| `streamable` \| `http` (`http` = алиас `streamable`) |
+| `MCP_HOST` | `127.0.0.1` | Адрес привязки MCP-сервера (для sse/streamable) |
+| `MCP_PORT` | `9010` | Порт MCP-сервера (отдельно от Flask `8888`) |
+
+**Включение streamable-http:**
+
+```bash
+sudo systemctl enable --now hexstrike-mcp   # поднимает MCP на :9010
+```
+
+Затем переключите OpenCode на remote-подключение в `~/.opencode/opencode.jsonc`:
+
+```jsonc
+"hexstrike": {
+  "type": "remote",
+  "url": "http://127.0.0.1:9010/mcp",
+  "enabled": true
+}
+```
+
+Эндпоинты: streamable-http → `…/mcp`, SSE → `…/sse`. CLI-флаги `--transport`,
+`--host`, `--port` переопределяют env.
+
+### Оптимизатор контекста
+
+Постобработка вывода инструментов перед возвратом агенту: меньше контекста →
+быстрее ответы и экономия токенов. Включён по умолчанию, консервативные пороги
+(короткие строки < 1000 символов не трогаются, LLM-суммаризации нет).
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `MCP_OPTIMIZER_ENABLED` | `true` | Вкл/выкл оптимизатор |
+| `MCP_OPTIMIZER_MAX_CHARS` | `20000` | Порог трюнкации длинного вывода (head+tail) |
+| `MCP_OPTIMIZER_DEDUP` | `true` | Дедупликация одинаковых строк |
+| `MCP_OPTIMIZER_STRIP_ANSI` | `true` | Удаление ANSI/escape-кодов и прогресс-баров |
+
+Полностью обратимо — установите `MCP_OPTIMIZER_ENABLED=false`, чтобы отключить.
+
+---
+
 ## Синхронизация с upstream
 
 Upstream `0x4m4/hexstrike-ai` фактически заморожен, поэтому регулярная

@@ -5,6 +5,31 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/),
 версионирование — [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [6.3.0] — 2026-06-20
+
+### Добавлено
+
+- **Транспорт MCP (F2):** `stdio` (по умолчанию), `sse`, `streamable-http` — переключение одной переменной `MCP_TRANSPORT`. Прямо лечит «обрывы OpenCode↔сервер» при длительных сканах
+- Второй systemd-юнит `hexstrike-mcp.service` (порт 9010) для streamable/sse-режима; выключен по умолчанию
+- CLI-флаги MCP: `--transport`, `--host`, `--port`; env: `MCP_TRANSPORT`, `MCP_HOST`, `MCP_PORT`
+- **Оптимизатор контекста (F4):** `hexstrike_optimizer.py` — детерминированная постобработка вывода (strip ANSI, схлопывание прогресс-баров, дедупликация, трюнкация head+tail). Экономия токенов/ускорение цикла агент↔сервер. Вкл по умолчанию, env: `MCP_OPTIMIZER_ENABLED/MAX_CHARS/DEDUP/STRIP_ANSI`
+- **Тестовая инфраструктура (T1):** `pytest`, `pytest-cov`, `pytest.ini`, `tests/` (115 unit-тестов), CI на GitHub Actions (Python 3.13). Покрытие: mcp.py 34%, server.py 14%
+- **Синхронизация с upstream (F1):** `scripts/sync-upstream.sh` — maintenance-мерж `0x4m4/hexstrike-ai` с авто-защитой нашего набора файлов
+- `requirements-dev.txt` для dev/test-зависимостей
+
+### Изменено
+
+- **Описания параметров инструментов (F3):** все 25 MCP-инструментов (102 параметра) переведены на `Annotated[type, Field(description=...)]` — описания теперь доходят до агента (FastMCP не парсит docstring `Args:`)
+- `requirements.txt`: добавлен `uvicorn` (рантайм SSE/streamable-http)
+- `deploy.sh`: копирование `hexstrike_optimizer.py`; новый шаг создания `hexstrike-mcp.service`; 11→12 шагов
+- `OpenCodeStart.sh`: явная фиксация `MCP_TRANSPORT=stdio`; исправлена устаревшая ссылка на `deploy.sh`
+- Структура README обновлена под новые файлы
+
+### Исправлено
+
+- Health-check MCP-клиента запрашивал `/health` (HTML-панель) вместо `/health?json` → ложные «Failed to establish connection» + ~10с задержка старта. Исправлено в `_initialize_connection` и `check_health`
+- Регрессионный тест `test_tool_schemas.py` фиксирует валидность всех `inputSchema` и наличие описаний
+
 ## [6.2.0] — 2026-06-10
 
 ### Добавлено
