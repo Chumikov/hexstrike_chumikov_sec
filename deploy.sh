@@ -21,7 +21,7 @@ MAX_REQUESTS=1000
 VENV_DIR="${HEXSTRIKE_DIR}/venv"
 
 STEP=0
-STEPS_TOTAL=11
+STEPS_TOTAL=12
 
 step() {
     STEP=$((STEP + 1))
@@ -99,6 +99,13 @@ ok "hexstrike_server.py скопирован"
 
 cp "${SCRIPT_DIR}/hexstrike_mcp.py" "${HEXSTRIKE_DIR}/hexstrike_mcp.py"
 ok "hexstrike_mcp.py скопирован"
+
+if [[ -f "${SCRIPT_DIR}/hexstrike_optimizer.py" ]]; then
+    cp "${SCRIPT_DIR}/hexstrike_optimizer.py" "${HEXSTRIKE_DIR}/hexstrike_optimizer.py"
+    ok "hexstrike_optimizer.py скопирован"
+else
+    fail "hexstrike_optimizer.py не найден в ${SCRIPT_DIR} (нужен hexstrike_mcp.py)"
+fi
 
 if [[ -d "${SCRIPT_DIR}/templates" ]]; then
     mkdir -p "${HEXSTRIKE_DIR}/templates"
@@ -332,6 +339,51 @@ ok "venv Python: ${VENV_PYTHON_VERSION}"
 
 VENV_FLASK=$(${VENV_PIP} show flask 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "unknown")
 ok "venv flask: ${VENV_FLASK}"
+
+# ============================================================================
+
+step "Создание MCP systemd unit (опционально, streamable/sse)"
+
+MCP_SERVICE_FILE="/etc/systemd/system/hexstrike-mcp.service"
+MCP_PORT="${MCP_PORT:-9010}"
+MCP_TRANSPORT_DEFAULT="${MCP_TRANSPORT:-streamable}"
+
+cat > "$MCP_SERVICE_FILE" << EOF
+[Unit]
+Description=HexStrike AI MCP Server (streamable-http/sse transport)
+After=network.target hexstrike.service
+Requires=hexstrike.service
+
+[Service]
+Type=simple
+User=${RUN_USER}
+Group=${RUN_GROUP}
+WorkingDirectory=${HEXSTRIKE_DIR}
+Environment="${SYSTEMD_PATH}"
+Environment="MCP_TRANSPORT=${MCP_TRANSPORT_DEFAULT}"
+Environment="MCP_HOST=127.0.0.1"
+Environment="MCP_PORT=${MCP_PORT}"
+ExecStart=${VENV_PYTHON} ${HEXSTRIKE_DIR}/hexstrike_mcp.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+ok "Файл ${MCP_SERVICE_FILE} создан"
+systemctl daemon-reload
+ok "systemctl daemon-reload выполнен"
+
+# НЕ включаем автоматически: по умолчанию используется stdio (OpenCodeStart.sh).
+# Пользователь включает streamable/sse явно, когда хочет переключить транспорт.
+if systemctl is-enabled hexstrike-mcp &>/dev/null; then
+    ok "Сервис hexstrike-mcp уже включён"
+else
+    info "Сервис hexstrike-mcp НЕ включён (по умолчанию = stdio через OpenCodeStart.sh)"
+    info "Для streamable/sse: sudo systemctl enable --now hexstrike-mcp"
+    info "Затем переключите OpenCode на remote: url http://127.0.0.1:${MCP_PORT}/mcp"
+fi
 
 # ============================================================================
 

@@ -173,6 +173,21 @@ DEFAULT_HEXSTRIKE_SERVER = "http://127.0.0.1:8888"
 DEFAULT_REQUEST_TIMEOUT = 300
 MAX_RETRIES = 3
 
+# MCP transport configuration (F2, v6.3.0).
+# Default keeps the historic stdio behaviour (OpenCode spawns this process and
+# talks over stdin/stdout). streamable/sse are opt-in via MCP_TRANSPORT env,
+# served by the dedicated hexstrike-mcp systemd unit on :9010.
+DEFAULT_MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")   # stdio | sse | streamable | http
+DEFAULT_MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1")
+DEFAULT_MCP_PORT = int(os.getenv("MCP_PORT", "9010"))
+# Map our transport names -> FastMCP.run(transport=...) literals.
+TRANSPORT_MAP = {
+    "stdio": "stdio",
+    "sse": "sse",
+    "streamable": "streamable-http",
+    "http": "streamable-http",
+}
+
 class LRUCache:
     """Thread-safe LRU Cache with TTL support for MCP-level caching."""
 
@@ -425,7 +440,9 @@ class AsyncHexStrikeClient:
         for i in range(MAX_RETRIES):
             try:
                 logger.info(f"🔗 Attempting to connect to HexStrike AI API at {self.server_url} (attempt {i+1}/{MAX_RETRIES})")
-                test_response = self._sync_session.get(f"{self.server_url}/health", timeout=5)
+                # /health returns the HTML panel by default (since v6.1.1);
+                # request JSON explicitly to avoid a parse error + 3x backoff delay.
+                test_response = self._sync_session.get(f"{self.server_url}/health?json", timeout=5)
                 test_response.raise_for_status()
                 health_check = test_response.json()
                 connected = True
@@ -661,7 +678,7 @@ class AsyncHexStrikeClient:
             return asyncio.run(self.execute_batch(batch))
 
     def check_health(self) -> Dict[str, Any]:
-        return self.safe_get("health")
+        return self.safe_get("health?json")
 
     def execute_command(self, command: str, use_cache: bool = True) -> Dict[str, Any]:
         return self.safe_post("api/command", {"command": command, "use_cache": use_cache})
@@ -679,8 +696,10 @@ class AsyncHexStrikeClient:
 
 HexStrikeClient = AsyncHexStrikeClient
 
-def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
-    mcp = FastMCP("hexstrike-ai-mcp")
+def setup_mcp_server(hexstrike_client: HexStrikeClient,
+                     host: str = DEFAULT_MCP_HOST,
+                     port: int = DEFAULT_MCP_PORT) -> FastMCP:
+    mcp = FastMCP("hexstrike-ai-mcp", host=host, port=port)
 
     @mcp.tool()
     def batch_execute(
@@ -1404,6 +1423,14 @@ def parse_args():
                         help="Rate limit requests per second (default: 10.0)")
     parser.add_argument("--rate-burst", type=int, default=20,
                         help="Rate limit burst size (default: 20)")
+    parser.add_argument("--transport", type=str, default=DEFAULT_MCP_TRANSPORT,
+                        choices=["stdio", "sse", "streamable", "http"],
+                        help=f"MCP transport (default: {DEFAULT_MCP_TRANSPORT}; env MCP_TRANSPORT). "
+                             "stdio = OpenCode spawns process; sse/streamable/http = serve on host:port")
+    parser.add_argument("--host", type=str, default=DEFAULT_MCP_HOST,
+                        help=f"MCP bind host for sse/streamable (default: {DEFAULT_MCP_HOST}; env MCP_HOST)")
+    parser.add_argument("--port", type=int, default=DEFAULT_MCP_PORT,
+                        help=f"MCP bind port for sse/streamable (default: {DEFAULT_MCP_PORT}; env MCP_PORT)")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     return parser.parse_args()
 
@@ -1438,10 +1465,14 @@ def main():
             logger.info(f"🏥 Server health status: {health.get('status')}")
             logger.info(f"📊 Version: {health.get('version', 'unknown')}")
 
-        mcp = setup_mcp_server(hexstrike_client)
-        logger.info("🚀 Starting HexStrike AI MCP server")
+        mcp = setup_mcp_server(hexstrike_client, host=args.host, port=args.port)
+        transport = TRANSPORT_MAP.get(args.transport, "stdio")
+        logger.info(f"🚀 Starting HexStrike AI MCP server (transport={args.transport} -> {transport})")
         logger.info("🤖 Ready to serve AI agents with enhanced cybersecurity capabilities")
-        mcp.run()
+        if transport != "stdio":
+            logger.info(f"🌐 MCP listening on http://{args.host}:{args.port}"
+                        f"{'/sse' if transport == 'sse' else '/mcp'}")
+        mcp.run(transport=transport)
     except Exception as e:
         logger.error(f"💥 Error starting MCP server: {str(e)}")
         logger.error(traceback.format_exc())
