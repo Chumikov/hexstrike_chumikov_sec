@@ -35,6 +35,7 @@ import aiohttp
 import requests
 from mcp.server.fastmcp import FastMCP
 from pathlib import Path
+from hexstrike_optimizer import OutputOptimizer
 
 def get_version() -> str:
     try:
@@ -414,6 +415,7 @@ class AsyncHexStrikeClient:
             "cache_hits": 0,
             "rate_limit_waits": 0
         }
+        self.optimizer = OutputOptimizer.from_env()
         self._initialize_connection()
 
     def _initialize_connection(self) -> None:
@@ -465,7 +467,7 @@ class AsyncHexStrikeClient:
                 self._stats["total_requests"] += 1
                 result = request_func(*args, **kwargs)
                 self._stats["successful_requests"] += 1
-                return result
+                return self.optimizer.optimize(result)
 
             except Exception as e:
                 last_error = ErrorClassifier.classify(e)
