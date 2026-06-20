@@ -64,8 +64,12 @@ curl http://127.0.0.1:8888/health
 | `hexstrike_mcp.py` | MCP-клиент на FastMCP — мост между AI-агентами и сервером |
 | `deploy.sh` | Полный деплой: venv, зависимости, systemd, проверка |
 | `requirements.txt` | Зависимости Python с фиксированными версиями |
+| `requirements-dev.txt` | Dev/test-зависимости (pytest, pytest-cov) |
 | `OpenCodeStart.sh` | Автозапуск сервера + MCP-клиента для OpenCode |
 | `templates/health_panel.html` | Шаблон HTML-панели мониторинга |
+| `scripts/sync-upstream.sh` | Maintenance-синхронизация с upstream `0x4m4/hexstrike-ai` |
+| `tests/` | Unit-тесты (pytest) |
+| `.github/workflows/ci.yml` | CI: pytest на каждый push/PR |
 
 ---
 
@@ -239,3 +243,33 @@ curl -s http://127.0.0.1:8888/health?json | python3 -c "import sys,json; print(j
 | `batch_execute()` | Параллельное выполнение запросов |
 | `get_mcp_stats()` | Статистика кэша, rate limiter, запросов |
 | `clear_mcp_cache()` | Очистка локального MCP-кэша |
+
+---
+
+## Синхронизация с upstream
+
+Upstream `0x4m4/hexstrike-ai` фактически заморожен, поэтому регулярная
+синхронизация не требуется. Скрипт `scripts/sync-upstream.sh` используется в
+maintenance-режиме — для точечного подтягивания фиксов CVE/безопасности с
+**сохранением нашего набора файлов**.
+
+```bash
+bash scripts/sync-upstream.sh
+```
+
+Что делает скрипт:
+
+1. Добавляет remote `upstream` и делает `fetch`.
+2. Создаёт изолированную ветку `upstream-sync` от `master`.
+3. Сливает `upstream/master` (`--allow-unrelated-histories`, т.к. репозиторий независимый, а не GitHub-fork).
+4. **Автоматически защищает** наш набор (восстанавливает из `HEAD`):
+   `README.md`, `deploy.sh`, `VERSION`, `CHANGELOG.md`, `templates/`,
+   `requirements.txt`, `requirements-dev.txt`, `OpenCodeStart.sh`,
+   `hexstrike_mcp.py`, `scripts/`, `tests/`, `.github/`, `pytest.ini`, `.gitignore`.
+5. **НЕ трогает** `hexstrike_server.py` — оставляет conflict-маркеры для
+   ручного ревью (там наши правки health-панели).
+6. Генерирует `MERGE_UPSTREAM_REPORT.md` со списком конфликтов и защищённых файлов.
+7. **Пауза**: скрипт не делает auto-commit — ревью и коммит выполняются вручную.
+
+После запуска разрешите маркеры (особенно в `hexstrike_server.py`), прогоните
+`pytest`, закоммитьте и слейте ветку `upstream-sync` в `master`.
