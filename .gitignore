@@ -3,3 +3,13 @@ hexstrike.log
 __pycache__/
 *.pyc
 .env
+
+# Test/coverage artifacts
+.coverage
+.coverage.*
+.pytest_cache/
+htmlcov/
+
+# Внутренние документы развития (не публиковать)
+Develop_Plan.md
+forks.md
