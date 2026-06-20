@@ -22,7 +22,7 @@ import asyncio
 import hashlib
 import json
 import time
-from typing import Dict, Any, Optional, List, Tuple, Union
+from typing import Dict, Any, Optional, List, Tuple, Union, Annotated
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from enum import Enum
@@ -33,6 +33,7 @@ import traceback
 
 import aiohttp
 import requests
+from pydantic import Field
 from mcp.server.fastmcp import FastMCP
 from pathlib import Path
 from hexstrike_optimizer import OutputOptimizer
@@ -682,7 +683,11 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
     mcp = FastMCP("hexstrike-ai-mcp")
 
     @mcp.tool()
-    def batch_execute(requests: str, max_concurrent: int = 5, fail_fast: bool = False) -> Dict[str, Any]:
+    def batch_execute(
+        requests: Annotated[str, Field(description='JSON string: list of requests, each {"endpoint": "...", "method": "POST", "data": {...}}')],
+        max_concurrent: Annotated[int, Field(description="Maximum number of concurrent requests")] = 5,
+        fail_fast: Annotated[bool, Field(description="Stop on first error if True")] = False,
+    ) -> Dict[str, Any]:
         """
         Execute multiple API requests in parallel with batch optimization.
 
@@ -717,7 +722,9 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return stats
 
     @mcp.tool()
-    def clear_mcp_cache(pattern: str = "") -> Dict[str, Any]:
+    def clear_mcp_cache(
+        pattern: Annotated[str, Field(description="Optional pattern to match cache keys (empty = clear all)")] = "",
+    ) -> Dict[str, Any]:
         """
         Clear MCP-level cache. Optionally filter by pattern.
 
@@ -732,7 +739,12 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def nmap_scan(target: str, scan_type: str = "-sV", ports: str = "", additional_args: str = "") -> Dict[str, Any]:
+    def nmap_scan(
+        target: Annotated[str, Field(description="The IP address or hostname to scan")],
+        scan_type: Annotated[str, Field(description="Scan type (e.g. -sV version detection, -sC scripts)")] = "-sV",
+        ports: Annotated[str, Field(description="Comma-separated list of ports or port ranges")] = "",
+        additional_args: Annotated[str, Field(description="Additional Nmap arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute an enhanced Nmap scan against a target with real-time logging.
 
@@ -755,7 +767,12 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def gobuster_scan(url: str, mode: str = "dir", wordlist: str = "/usr/share/wordlists/dirb/common.txt", additional_args: str = "") -> Dict[str, Any]:
+    def gobuster_scan(
+        url: Annotated[str, Field(description="The target URL")],
+        mode: Annotated[str, Field(description="Scan mode (dir, dns, fuzz, vhost)")] = "dir",
+        wordlist: Annotated[str, Field(description="Path to wordlist file")] = "/usr/share/wordlists/dirb/common.txt",
+        additional_args: Annotated[str, Field(description="Additional Gobuster arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute Gobuster to find directories, DNS subdomains, or virtual hosts.
 
@@ -778,7 +795,13 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def nuclei_scan(target: str, severity: str = "", tags: str = "", template: str = "", additional_args: str = "") -> Dict[str, Any]:
+    def nuclei_scan(
+        target: Annotated[str, Field(description="The target URL or IP")],
+        severity: Annotated[str, Field(description="Filter by severity (critical,high,medium,low,info)")] = "",
+        tags: Annotated[str, Field(description="Filter by tags (e.g. cve,rce,lfi)")] = "",
+        template: Annotated[str, Field(description="Custom template path")] = "",
+        additional_args: Annotated[str, Field(description="Additional Nuclei arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute Nuclei vulnerability scanner with enhanced logging.
 
@@ -802,8 +825,15 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def prowler_scan(provider: str = "aws", profile: str = "default", region: str = "", checks: str = "",
-                     output_dir: str = "/tmp/prowler_output", output_format: str = "json", additional_args: str = "") -> Dict[str, Any]:
+    def prowler_scan(
+        provider: Annotated[str, Field(description="Cloud provider (aws, azure, gcp)")] = "aws",
+        profile: Annotated[str, Field(description="AWS/Cloud profile to use")] = "default",
+        region: Annotated[str, Field(description="Specific region to scan")] = "",
+        checks: Annotated[str, Field(description="Specific checks to run")] = "",
+        output_dir: Annotated[str, Field(description="Directory to save results")] = "/tmp/prowler_output",
+        output_format: Annotated[str, Field(description="Output format (json, csv, html)")] = "json",
+        additional_args: Annotated[str, Field(description="Additional Prowler arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute Prowler for comprehensive cloud security assessment.
 
@@ -830,8 +860,14 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def trivy_scan(scan_type: str = "image", target: str = "", output_format: str = "json",
-                   severity: str = "", output_file: str = "", additional_args: str = "") -> Dict[str, Any]:
+    def trivy_scan(
+        scan_type: Annotated[str, Field(description="Type of scan (image, fs, repo, config)")] = "image",
+        target: Annotated[str, Field(description="Target to scan (image name, directory, repository)")] = "",
+        output_format: Annotated[str, Field(description="Output format (json, table, sarif)")] = "json",
+        severity: Annotated[str, Field(description="Severity filter (UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL)")] = "",
+        output_file: Annotated[str, Field(description="File to save results")] = "",
+        additional_args: Annotated[str, Field(description="Additional Trivy arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute Trivy for container and filesystem vulnerability scanning.
 
@@ -857,7 +893,10 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def nikto_scan(target: str, additional_args: str = "") -> Dict[str, Any]:
+    def nikto_scan(
+        target: Annotated[str, Field(description="The target URL or IP")],
+        additional_args: Annotated[str, Field(description="Additional Nikto arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute Nikto web vulnerability scanner.
 
@@ -878,7 +917,11 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def sqlmap_scan(url: str, data: str = "", additional_args: str = "") -> Dict[str, Any]:
+    def sqlmap_scan(
+        url: Annotated[str, Field(description="The target URL")],
+        data: Annotated[str, Field(description="POST data for testing")] = "",
+        additional_args: Annotated[str, Field(description="Additional SQLMap arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute SQLMap for SQL injection testing.
 
@@ -900,8 +943,15 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def hydra_attack(target: str, service: str, username: str = "", username_file: str = "",
-                     password: str = "", password_file: str = "", additional_args: str = "") -> Dict[str, Any]:
+    def hydra_attack(
+        target: Annotated[str, Field(description="The target IP or hostname")],
+        service: Annotated[str, Field(description="The service to attack (ssh, ftp, http, etc.)")],
+        username: Annotated[str, Field(description="Single username to test")] = "",
+        username_file: Annotated[str, Field(description="File containing usernames")] = "",
+        password: Annotated[str, Field(description="Single password to test")] = "",
+        password_file: Annotated[str, Field(description="File containing passwords")] = "",
+        additional_args: Annotated[str, Field(description="Additional Hydra arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute Hydra for password brute forcing.
 
@@ -928,8 +978,13 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def ffuf_scan(url: str, wordlist: str = "/usr/share/wordlists/dirb/common.txt", mode: str = "directory",
-                  match_codes: str = "200,204,301,302,307,401,403", additional_args: str = "") -> Dict[str, Any]:
+    def ffuf_scan(
+        url: Annotated[str, Field(description="The target URL")],
+        wordlist: Annotated[str, Field(description="Wordlist file to use")] = "/usr/share/wordlists/dirb/common.txt",
+        mode: Annotated[str, Field(description="Fuzzing mode (directory, vhost, parameter)")] = "directory",
+        match_codes: Annotated[str, Field(description="HTTP status codes to match")] = "200,204,301,302,307,401,403",
+        additional_args: Annotated[str, Field(description="Additional FFuf arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute FFuf for web fuzzing.
 
@@ -953,7 +1008,11 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def amass_scan(domain: str, mode: str = "enum", additional_args: str = "") -> Dict[str, Any]:
+    def amass_scan(
+        domain: Annotated[str, Field(description="The target domain")],
+        mode: Annotated[str, Field(description="Amass mode (enum, intel, viz)")] = "enum",
+        additional_args: Annotated[str, Field(description="Additional Amass arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute Amass for subdomain enumeration.
 
@@ -975,7 +1034,12 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def subfinder_scan(domain: str, silent: bool = True, all_sources: bool = False, additional_args: str = "") -> Dict[str, Any]:
+    def subfinder_scan(
+        domain: Annotated[str, Field(description="The target domain")],
+        silent: Annotated[bool, Field(description="Run in silent mode")] = True,
+        all_sources: Annotated[bool, Field(description="Use all sources")] = False,
+        additional_args: Annotated[str, Field(description="Additional Subfinder arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute Subfinder for passive subdomain enumeration.
 
@@ -998,10 +1062,17 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def httpx_probe(target: str, probe: bool = True, tech_detect: bool = False,
-                    status_code: bool = False, content_length: bool = False,
-                    title: bool = False, web_server: bool = False, threads: int = 50,
-                    additional_args: str = "") -> Dict[str, Any]:
+    def httpx_probe(
+        target: Annotated[str, Field(description="Target file or single URL")],
+        probe: Annotated[bool, Field(description="Enable probing")] = True,
+        tech_detect: Annotated[bool, Field(description="Enable technology detection")] = False,
+        status_code: Annotated[bool, Field(description="Show status codes")] = False,
+        content_length: Annotated[bool, Field(description="Show content length")] = False,
+        title: Annotated[bool, Field(description="Show page titles")] = False,
+        web_server: Annotated[bool, Field(description="Show web server")] = False,
+        threads: Annotated[int, Field(description="Number of threads")] = 50,
+        additional_args: Annotated[str, Field(description="Additional httpx arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute httpx for fast HTTP probing and technology detection.
 
@@ -1031,9 +1102,14 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def dirsearch_scan(url: str, extensions: str = "php,html,js,txt,xml,json",
-                       wordlist: str = "/usr/share/wordlists/dirsearch/common.txt",
-                       threads: int = 30, recursive: bool = False, additional_args: str = "") -> Dict[str, Any]:
+    def dirsearch_scan(
+        url: Annotated[str, Field(description="The target URL")],
+        extensions: Annotated[str, Field(description="File extensions to search for")] = "php,html,js,txt,xml,json",
+        wordlist: Annotated[str, Field(description="Wordlist file to use")] = "/usr/share/wordlists/dirsearch/common.txt",
+        threads: Annotated[int, Field(description="Number of threads to use")] = 30,
+        recursive: Annotated[bool, Field(description="Enable recursive scanning")] = False,
+        additional_args: Annotated[str, Field(description="Additional Dirsearch arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute Dirsearch for advanced directory and file discovery.
 
@@ -1059,9 +1135,14 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def katana_crawl(url: str, depth: int = 3, js_crawl: bool = True,
-                     form_extraction: bool = True, output_format: str = "json",
-                     additional_args: str = "") -> Dict[str, Any]:
+    def katana_crawl(
+        url: Annotated[str, Field(description="The target URL to crawl")],
+        depth: Annotated[int, Field(description="Crawling depth")] = 3,
+        js_crawl: Annotated[bool, Field(description="Enable JavaScript crawling")] = True,
+        form_extraction: Annotated[bool, Field(description="Enable form extraction")] = True,
+        output_format: Annotated[str, Field(description="Output format (json, txt)")] = "json",
+        additional_args: Annotated[str, Field(description="Additional Katana arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute Katana for next-generation crawling and spidering.
 
@@ -1088,10 +1169,18 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def nmap_advanced_scan(target: str, scan_type: str = "-sS", ports: str = "",
-                           timing: str = "T4", nse_scripts: str = "", os_detection: bool = False,
-                           version_detection: bool = False, aggressive: bool = False,
-                           stealth: bool = False, additional_args: str = "") -> Dict[str, Any]:
+    def nmap_advanced_scan(
+        target: Annotated[str, Field(description="The target IP address or hostname")],
+        scan_type: Annotated[str, Field(description="Nmap scan type (e.g. -sS, -sT, -sU)")] = "-sS",
+        ports: Annotated[str, Field(description="Specific ports to scan")] = "",
+        timing: Annotated[str, Field(description="Timing template (T0-T5)")] = "T4",
+        nse_scripts: Annotated[str, Field(description="Custom NSE scripts to run")] = "",
+        os_detection: Annotated[bool, Field(description="Enable OS detection")] = False,
+        version_detection: Annotated[bool, Field(description="Enable version detection")] = False,
+        aggressive: Annotated[bool, Field(description="Enable aggressive scanning")] = False,
+        stealth: Annotated[bool, Field(description="Enable stealth mode")] = False,
+        additional_args: Annotated[str, Field(description="Additional Nmap arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute advanced Nmap scans with custom NSE scripts and optimized timing.
 
@@ -1123,9 +1212,15 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def rustscan_fast_scan(target: str, ports: str = "", ulimit: int = 5000,
-                           batch_size: int = 4500, timeout: int = 1500,
-                           scripts: bool = False, additional_args: str = "") -> Dict[str, Any]:
+    def rustscan_fast_scan(
+        target: Annotated[str, Field(description="The target IP address or hostname")],
+        ports: Annotated[str, Field(description='Specific ports to scan (e.g. "22,80,443")')] = "",
+        ulimit: Annotated[int, Field(description="File descriptor limit")] = 5000,
+        batch_size: Annotated[int, Field(description="Batch size for scanning")] = 4500,
+        timeout: Annotated[int, Field(description="Timeout in milliseconds")] = 1500,
+        scripts: Annotated[bool, Field(description="Run Nmap scripts on discovered ports")] = False,
+        additional_args: Annotated[str, Field(description="Additional Rustscan arguments")] = "",
+    ) -> Dict[str, Any]:
         """
         Execute Rustscan for ultra-fast port scanning.
 
@@ -1168,7 +1263,10 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def execute_command(command: str, use_cache: bool = True) -> Dict[str, Any]:
+    def execute_command(
+        command: Annotated[str, Field(description="The command to execute")],
+        use_cache: Annotated[bool, Field(description="Whether to use caching")] = True,
+    ) -> Dict[str, Any]:
         """
         Execute an arbitrary command on the HexStrike AI server.
 
@@ -1194,7 +1292,11 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
             return {"success": False, "error": str(e), "stdout": "", "stderr": f"Error: {str(e)}"}
 
     @mcp.tool()
-    def intelligent_smart_scan(target: str, objective: str = "comprehensive", max_tools: int = 5) -> Dict[str, Any]:
+    def intelligent_smart_scan(
+        target: Annotated[str, Field(description="Target to scan")],
+        objective: Annotated[str, Field(description='Scanning objective: "comprehensive", "quick", or "stealth"')] = "comprehensive",
+        max_tools: Annotated[int, Field(description="Maximum number of tools to use")] = 5,
+    ) -> Dict[str, Any]:
         """
         Execute an intelligent scan using AI-driven tool selection.
 
@@ -1216,7 +1318,9 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def analyze_target_intelligence(target: str) -> Dict[str, Any]:
+    def analyze_target_intelligence(
+        target: Annotated[str, Field(description="Target URL, IP address, or domain to analyze")],
+    ) -> Dict[str, Any]:
         """
         Analyze target using AI-powered intelligence to create comprehensive profile.
 
@@ -1237,7 +1341,11 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def create_file(filename: str, content: str, binary: bool = False) -> Dict[str, Any]:
+    def create_file(
+        filename: Annotated[str, Field(description="Name of the file to create")],
+        content: Annotated[str, Field(description="Content to write to the file")],
+        binary: Annotated[bool, Field(description="Whether the content is binary data")] = False,
+    ) -> Dict[str, Any]:
         """
         Create a file with specified content on the HexStrike server.
 
@@ -1259,7 +1367,9 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         return result
 
     @mcp.tool()
-    def list_files(directory: str = ".") -> Dict[str, Any]:
+    def list_files(
+        directory: Annotated[str, Field(description="Directory to list (relative to server's base directory)")] = ".",
+    ) -> Dict[str, Any]:
         """
         List files in a directory on the HexStrike server.
 
