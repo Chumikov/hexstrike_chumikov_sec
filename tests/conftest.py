@@ -4,7 +4,52 @@ The heavy `hexstrike_server` module (~742KB) is imported lazily inside the
 fixtures that actually need it, so collecting/running the MCP-only unit tests
 does not pay that cost.
 """
+import importlib.util
+import sys
+import types
+
 import pytest
+
+
+def _install_optional_kali_module_stubs() -> None:
+    """Stub Kali-only modules so `hexstrike_server` imports in non-Kali CI.
+
+    `hexstrike_server.py` imports `mitmproxy` at module top level. On Kali it is
+    a system package (visible via the venv's --system-site-packages); in CI it is
+    absent and the import fails, breaking every test that touches the server
+    module. We inject lightweight stubs ONLY when the real package is not
+    importable, so Kali/local runs are unaffected.
+    """
+    if importlib.util.find_spec("mitmproxy") is not None:
+        return  # real mitmproxy available (Kali/local) — nothing to do
+
+    mp = types.ModuleType("mitmproxy")
+    mp_http = types.ModuleType("mitmproxy.http")
+    mp_tools = types.ModuleType("mitmproxy.tools")
+    mp_tools_dump = types.ModuleType("mitmproxy.tools.dump")
+    mp_options = types.ModuleType("mitmproxy.options")
+
+    class DumpMaster:  # minimal stub; never instantiated by the tested code paths
+        pass
+
+    class Options:
+        pass
+
+    mp_tools_dump.DumpMaster = DumpMaster
+    mp_options.Options = Options
+    mp.http = mp_http
+    mp.tools = mp_tools
+    mp_tools.dump = mp_tools_dump
+    mp.options = mp_options
+
+    sys.modules["mitmproxy"] = mp
+    sys.modules["mitmproxy.http"] = mp_http
+    sys.modules["mitmproxy.tools"] = mp_tools
+    sys.modules["mitmproxy.tools.dump"] = mp_tools_dump
+    sys.modules["mitmproxy.options"] = mp_options
+
+
+_install_optional_kali_module_stubs()
 
 
 @pytest.fixture
