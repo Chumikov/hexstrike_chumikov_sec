@@ -69,12 +69,16 @@ class AuditEvent:
         # Normalise: status stored as enum, serialised via .value on write.
 
     def to_row(self) -> tuple:
+        # Normalise enum values to their .value so the DB stores plain strings.
+        tier_value = self.tier.value if hasattr(self.tier, "value") else str(self.tier)
+        status_value = (self.status.value
+                        if hasattr(self.status, "value") else str(self.status))
         return (
             self.session_id,
             self.tool,
             self.target,
-            self.tier if isinstance(self.tier, str) else str(self.tier),
-            self.status.value if isinstance(self.status, AuditStatus) else str(self.status),
+            tier_value,
+            status_value,
             self.duration_ms,
             self.error,
             self.created_at,
@@ -102,11 +106,9 @@ class AuditLogger:
         error: Optional[str] = None,
     ) -> None:
         """Insert one audit row. Best-effort: errors are logged, not raised."""
-        if isinstance(status, AuditStatus):
-            status_value = status.value
-        else:
-            status_value = str(status)
-        tier_value = tier if isinstance(tier, str) else str(tier)
+        status_value = (status.value if hasattr(status, "value")
+                        else str(status))
+        tier_value = (tier.value if hasattr(tier, "value") else str(tier))
         try:
             with get_connection() as conn:
                 conn.execute(

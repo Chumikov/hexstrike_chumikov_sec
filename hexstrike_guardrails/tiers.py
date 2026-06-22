@@ -74,7 +74,8 @@ _SAFE_TOOLS: frozenset[str] = frozenset({
     "batch_execute", "get_mcp_stats", "clear_mcp_cache", "server_health",
     "list_files",
     # --- Passive recon (DNS / certificate transparency / APIs) ---------------
-    "subfinder", "amass_passive", "httpx_probe", "analyze_target_intelligence",
+    "subfinder", "subfinder_scan", "amass", "amass_passive",
+    "httpx", "httpx_probe", "analyze_target_intelligence",
     "gau", "waybackurls", "theharvester", "sherlock", "social-analyzer",
     "maltego", "shodan", "censys", "have-i-been-pwned", "crtsh",
     # --- Local binary analysis (no network) ----------------------------------
@@ -83,15 +84,15 @@ _SAFE_TOOLS: frozenset[str] = frozenset({
     "hash-identifier", "ophcrack", "searchsploit", "strings", "xxd", "file",
     "foremost", "exiftool", "photorec", "testdisk", "scalpel", "bulk_extractor",
     "stegsolve", "zsteg", "outguess", "steghide", "hashpump", "volatility",
-    "volatility3", "sleuthkit", "autopsy", "katana", "hakrawler", "arjun",
-    "paramspider", "wafw00f", "anew", "qsreplace", "uro", "postman",
+    "volatility3", "sleuthkit", "autopsy", "katana", "katana_crawl", "hakrawler",
+    "arjun", "paramspider", "wafw00f", "anew", "qsreplace", "uro", "postman",
     "api-schema-analyzer", "jwt-analyzer",
 })
 
 _INTRUSIVE_TOOLS: frozenset[str] = frozenset({
     # --- MCP active scanners -------------------------------------------------
     "nmap_scan", "gobuster_scan", "nuclei_scan", "prowler_scan", "trivy_scan",
-    "nikto_scan", "ffuf_scan", "amass_scan", "dirsearch_scan",
+    "nikto_scan", "ffuf_scan", "ffuf", "amass_scan", "dirsearch_scan",
     "rustscan_fast_scan", "intelligent_smart_scan",
     # --- Essential network/web scanners --------------------------------------
     "nmap", "gobuster", "dirb", "nikto", "masscan", "rustscan", "autorecon",
