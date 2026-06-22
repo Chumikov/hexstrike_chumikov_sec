@@ -54,6 +54,29 @@
   a { color: var(--green); text-decoration: none; } a:hover { text-decoration: underline; }
   .blink { animation: blink 1s step-end infinite; }
   @keyframes blink { 50% { opacity: 0; } }
+
+  /* Guardrails / sessions / audit (v6.4.0+) */
+  .tier-badge { font-size: 10px; padding: 1px 6px; border-radius: 3px; margin-left: 6px; text-transform: uppercase; letter-spacing: 1px; font-weight: bold; }
+  .tier-SAFE { background: #1a3a1a; color: #66ff66; border: 1px solid #2a5a2a; }
+  .tier-INTRUSIVE { background: #3a2a1a; color: #ffaa66; border: 1px solid #5a4a2a; }
+  .tier-DESTRUCTIVE { background: #3a1a1a; color: #ff6666; border: 1px solid #5a2a2a; }
+  .status-allowed { color: #66ff66; }
+  .status-blocked_scope, .status-blocked_tier, .status-blocked_rate { color: #ff6666; }
+  .status-killed { color: #ff3333; font-weight: bold; }
+  .status-error { color: #ffaa00; }
+  .kill-engaged { color: #ff3333; animation: blink 0.7s step-end infinite; font-weight: bold; }
+  .kill-idle { color: #66ff66; }
+  .sessions-table, .audit-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .sessions-table th, .audit-table th { color: var(--dim); font-weight: normal; text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); text-transform: uppercase; font-size: 10px; letter-spacing: 1px; }
+  .sessions-table td, .audit-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); }
+  .sessions-table tr:hover, .audit-table tr:hover { background: #1a1a1a; }
+  .severity-pill { display: inline-block; min-width: 18px; padding: 1px 5px; border-radius: 3px; text-align: center; font-size: 10px; margin-right: 3px; }
+  .sev-critical { background: #3a0a0a; color: #ff3333; border: 1px solid #5a2a2a; }
+  .sev-high { background: #3a1a0a; color: #ff6633; border: 1px solid #5a3a2a; }
+  .sev-medium { background: #2a2a0a; color: #ffaa00; border: 1px solid #4a4a2a; }
+  .sev-low { background: #0a1a3a; color: #3366ff; border: 1px solid #2a3a5a; }
+  .scope-pill { display: inline-block; background: #1a1a3a; color: #8888cc; font-size: 10px; padding: 2px 6px; border-radius: 3px; margin: 2px; border: 1px solid #333366; word-break: break-all; }
+  .empty-hint { color: var(--dim); font-style: italic; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -68,6 +91,10 @@
   <div class="stat-card {{ 'danger' if cpu > 80 else 'warn' if cpu > 60 else '' }}"><div class="label">CPU</div><div class="value">{{ cpu | float | round(1) }}%</div></div>
   <div class="stat-card {{ 'danger' if mem > 90 else 'warn' if mem > 70 else '' }}"><div class="label">Memory</div><div class="value">{{ mem | float | round(1) }}%</div></div>
   <div class="stat-card"><div class="label">Disk</div><div class="value">{{ disk | float | round(1) }}%</div></div>
+  {% if guardrails %}
+  <div class="stat-card {{ 'danger' if guardrails.kill_switch.engaged else '' }}"><div class="label">Kill Switch</div><div class="value {{ 'kill-engaged' if guardrails.kill_switch.engaged else 'kill-idle' }}">{{ 'ENGAGED' if guardrails.kill_switch.engaged else 'IDLE' }}</div></div>
+  <div class="stat-card {{ 'danger' if guardrails.audit.counts.blocked_scope or guardrails.audit.counts.blocked_tier or guardrails.audit.counts.blocked_rate else '' }}"><div class="label">Blocks (total)</div><div class="value">{{ (guardrails.audit.counts.blocked_scope or 0) + (guardrails.audit.counts.blocked_tier or 0) + (guardrails.audit.counts.blocked_rate or 0) }}</div></div>
+  {% endif %}
 </div>
 
 <div class="section">
@@ -104,6 +131,93 @@
     <div class="sys-item"><div class="sys-label">Cache Evictions</div><div class="sys-value">{{ cache_evictions }}</div></div>
   </div>
 </div>
+
+{% if guardrails %}
+<div class="section">
+  <h2>&#9888; GUARDRAILS <span class="info-badge">v6.4.0</span></h2>
+  <div class="sys-grid">
+    <div class="sys-item"><div class="sys-label">Kill Switch</div><div class="sys-value {{ 'kill-engaged' if guardrails.kill_switch.engaged else 'kill-idle' }}">{{ 'ENGAGED' if guardrails.kill_switch.engaged else 'IDLE' }}</div></div>
+    <div class="sys-item"><div class="sys-label">Sessions w/ processes</div><div class="sys-value">{{ guardrails.kill_switch.sessions_with_procs }}</div></div>
+    <div class="sys-item"><div class="sys-label">Registered processes</div><div class="sys-value">{{ guardrails.kill_switch.registered_procs }}</div></div>
+    <div class="sys-item"><div class="sys-label">Rate limit (per target)</div><div class="sys-value">{{ guardrails.rate_limiter.max_concurrent }} concurrent / {{ guardrails.rate_limiter.max_rps }} rps</div></div>
+    <div class="sys-item"><div class="sys-label">Tracked targets</div><div class="sys-value">{{ guardrails.rate_limiter.tracked_targets }}</div></div>
+    <div class="sys-item"><div class="sys-label">In-flight slots</div><div class="sys-value">{{ guardrails.rate_limiter.in_flight_slots }}</div></div>
+    <div class="sys-item"><div class="sys-label">Autoconfirm destructive</div><div class="sys-value">{{ 'YES' if guardrails.autoconfirm_destructive else 'NO' }}</div></div>
+    <div class="sys-item"><div class="sys-label">Audit events (total)</div><div class="sys-value">{{ guardrails.audit.total }}</div></div>
+  </div>
+  <div style="margin-top:15px">
+    <div class="sys-label" style="margin-bottom:5px">Default scope ({{ guardrails.scope_rules | length }} rule{{ '' if guardrails.scope_rules | length == 1 else 's' }})</div>
+    {% if guardrails.scope_rules %}
+      {% for rule in guardrails.scope_rules %}<span class="scope-pill">{{ rule }}</span>{% endfor %}
+    {% else %}
+      <span class="empty-hint">Empty = allow-all (no scope restriction)</span>
+    {% endif %}
+  </div>
+  <div style="margin-top:15px">
+    <div class="sys-label" style="margin-bottom:5px">Tier distribution</div>
+    <span class="tier-badge tier-SAFE">SAFE {{ guardrails.tier_counts.SAFE }}</span>
+    <span class="tier-badge tier-INTRUSIVE">INTRUSIVE {{ guardrails.tier_counts.INTRUSIVE }}</span>
+    <span class="tier-badge tier-DESTRUCTIVE">DESTRUCTIVE {{ guardrails.tier_counts.DESTRUCTIVE }}</span>
+  </div>
+</div>
+
+<div class="section">
+  <h2>&#9633; RECENT SESSIONS</h2>
+  {% if sessions %}
+  <table class="sessions-table">
+    <thead><tr>
+      <th>ID</th><th>Target</th><th>Status</th><th>Findings</th><th>Severity</th><th>Created</th><th></th>
+    </tr></thead>
+    <tbody>
+      {% for s in sessions %}
+      <tr>
+        <td><code>{{ s.id[:8] }}</code></td>
+        <td>{{ s.target }}</td>
+        <td>{{ s.status }}</td>
+        <td>{{ s.finding_count }}</td>
+        <td>
+          {% if s.severity_counts.critical %}<span class="severity-pill sev-critical" title="critical">{{ s.severity_counts.critical }}</span>{% endif %}
+          {% if s.severity_counts.high %}<span class="severity-pill sev-high" title="high">{{ s.severity_counts.high }}</span>{% endif %}
+          {% if s.severity_counts.medium %}<span class="severity-pill sev-medium" title="medium">{{ s.severity_counts.medium }}</span>{% endif %}
+          {% if s.severity_counts.low %}<span class="severity-pill sev-low" title="low">{{ s.severity_counts.low }}</span>{% endif %}
+          {% if not s.finding_count %}<span class="empty-hint">&mdash;</span>{% endif %}
+        </td>
+        <td>{{ s.created_at[:19] }}</td>
+        <td><a href="/api/session/{{ s.id }}">details</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <span class="empty-hint">No sessions yet. Create one via <code>POST /api/session/create</code>.</span>
+  {% endif %}
+</div>
+
+<div class="section">
+  <h2>&#9888; RECENT AUDIT</h2>
+  {% if guardrails.audit.recent %}
+  <table class="audit-table">
+    <thead><tr>
+      <th>When</th><th>Tool</th><th>Target</th><th>Tier</th><th>Status</th><th>Session</th>
+    </tr></thead>
+    <tbody>
+      {% for e in guardrails.audit.recent %}
+      <tr>
+        <td>{{ e.created_at[5:19] }}</td>
+        <td><code>{{ e.tool }}</code></td>
+        <td>{{ e.target or '-' }}</td>
+        <td><span class="tier-badge tier-{{ e.tier }}">{{ e.tier }}</span></td>
+        <td class="status-{{ e.status }}">{{ e.status }}</td>
+        <td>{% if e.session_id %}<code>{{ e.session_id[:8] }}</code>{% else %}-{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <span class="empty-hint">No audit events yet. Audit log fills as tools are dispatched through guardrails.</span>
+  {% endif %}
+</div>
+{% endif %}
 
 <div class="footer"><a href="https://github.com/Chumikov/hexstrike_chumikov_sec" target="_blank">HexStrike AI v{{ version }} &middot; Chumikov Sec</a></div>
 <script>

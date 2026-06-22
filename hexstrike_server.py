@@ -9218,6 +9218,12 @@ def health_check():
     cs = cache.get_stats()
 
     if request.args.get("json") is not None or request.headers.get("Accept") == "application/json":
+        gr_snapshot = None
+        try:
+            from hexstrike_guardrails.state import get_state as _get_gr_state
+            gr_snapshot = _get_gr_state().snapshot()
+        except Exception:
+            pass
         return jsonify({
             "status": "healthy",
             "message": "HexStrike AI Tools API Server is operational",
@@ -9229,7 +9235,8 @@ def health_check():
             "category_stats": category_stats,
             "cache_stats": cs,
             "telemetry": tel,
-            "uptime": uptime
+            "uptime": uptime,
+            "guardrails": gr_snapshot,
         })
 
     def fmt_bytes(b):
@@ -9291,6 +9298,28 @@ def health_check():
             tools_html += f'<div class="{item_class}">{dot}<span class="{name_class}">{clean}</span>{badge}</div>\n'
         tools_html += '</div>\n'
 
+    # Optional guardrails / pentest_session context (v6.4.0+).
+    # If the guardrails package is not registered (e.g. during minimal imports),
+    # the health panel simply hides the corresponding sections.
+    guardrails_ctx = None
+    sessions_ctx = []
+    try:
+        from hexstrike_guardrails.state import get_state as _get_gr_state
+        try:
+            gr_state = _get_gr_state()
+            guardrails_ctx = gr_state.snapshot()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        from pentest_session import PentestSessionManager as _PSM
+        if "_psm_singleton" not in health_check.__dict__:
+            health_check._psm_singleton = _PSM()  # type: ignore[attr-defined]
+        sessions_ctx = health_check._psm_singleton.list_sessions()[:10]  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
     return render_template("health_panel.html",
         version=get_version(),
         uptime=f"{uptime:.0f}",
@@ -9311,6 +9340,8 @@ def health_check():
         net_in=net_in,
         net_out=net_out,
         cache_evictions=cs.get("evictions", 0) if isinstance(cs, dict) else 0,
+        guardrails=guardrails_ctx,
+        sessions=sessions_ctx,
     )
 
 @app.route("/api/command", methods=["POST"])
@@ -17432,6 +17463,31 @@ def get_alternative_tools():
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 
+
+# ============================================================================
+# v6.4.0+: register HexStrike Guardrails (scope/tier/rate/kill/audit) and the
+# pentest-session endpoints (/api/session/*). Done at module level so that
+# `gunicorn hexstrike_server:app` also picks them up; the `if __name__ ==
+# "__main__"` block below does NOT re-register them.
+# Both registrations are best-effort: a missing dependency must not break
+# the API server.
+# ============================================================================
+def _register_optional_blueprints():
+    try:
+        from hexstrike_guardrails import register_guardrails
+        register_guardrails(app)
+    except Exception:
+        logger.exception("guardrails registration failed; continuing without guardrails")
+    try:
+        from pentest_session import register_session_endpoints
+        register_session_endpoints(app)
+    except Exception:
+        logger.exception("pentest_session registration failed; continuing without /api/session/*")
+
+
+_register_optional_blueprints()
+
+
 if __name__ == "__main__":
     # Display the beautiful new banner
     print(BANNER)
@@ -17464,5 +17520,8 @@ if __name__ == "__main__":
     for line in startup_info.strip().split('\n'):
         if line.strip():
             logger.info(line)
+
+    # Guardrails + pentest_session blueprints are registered at module level
+    # (see _register_optional_blueprints above) so they also work under gunicorn.
 
     app.run(host=API_HOST, port=API_PORT, debug=DEBUG_MODE)
