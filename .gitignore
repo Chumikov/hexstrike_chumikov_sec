@@ -13,3 +13,18 @@ htmlcov/
 # Внутренние документы развития (не публиковать)
 Develop_Plan.md
 forks.md
+docs/hexstrike_guardrails/
+
+# Результаты тестов оптимизатора контекста (локальные, не публиковать)
+OPtTests/
+
+# Guardrails / pentest_session runtime data (v6.4.0+)
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/*.sqlite
+data/*.sqlite-journal
+data/*.sqlite-wal
+data/*.sqlite-shm
+data/reports/
