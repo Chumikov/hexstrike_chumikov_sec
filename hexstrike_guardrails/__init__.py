@@ -37,7 +37,8 @@ _PUBLIC_NAMES = {
     # audit
     "AuditLogger", "AuditEvent", "AuditStatus",
     # state + blueprint
-    "GuardrailsState", "GuardrailsBlocked", "get_state", "register_guardrails",
+    "GuardrailsState", "GuardrailsBlocked", "get_state", "reset_state",
+    "register_guardrails", "wrap_executor",
 }
 
 _SUBMODULE_OF = {
@@ -48,7 +49,8 @@ _SUBMODULE_OF = {
     "KillSwitch": "killswitch",
     "AuditLogger": "audit", "AuditEvent": "audit", "AuditStatus": "audit",
     "GuardrailsState": "state", "GuardrailsBlocked": "state", "get_state": "state",
-    "register_guardrails": "blueprint",
+    "reset_state": "state",
+    "register_guardrails": "blueprint", "wrap_executor": "blueprint",
 }
 
 __all__ = sorted(_PUBLIC_NAMES | {
