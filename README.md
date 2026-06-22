@@ -2,7 +2,7 @@
 
 В своей статье https://habr.com/ru/articles/985450/ я рассмотрел интеграцию Hexstrike-AI и OpenCode в Kali Linux. С того времени вышло много обновлений OpenCode и всего пара патчей безопасности для HexStrike, а работа связки оставалась крайне нестабильной и местами медленной. Ждать обещанную 7-ю версию HexStrike (которая, судя по всему, не выйдет в open-source) я не стал — и начал развивать собственный форк.
 
-Текущая версия: **v6.3.0 «Stability»**. Релиз бьёт по двум главным болям — «нестабильно» (альтернативные MCP-транспорты SSE/streamable-http) и «медленно» (оптимизатор контекста экономит токены), плюс закладывает тестовый фундамент (115 unit-тестов + CI). Upstream фактически заморожен, поэтому репозиторий перешёл в режим самостоятельного развития.
+Текущая версия: **v6.4.0 «Guardrails»**. Релиз добавляет слой безопасности и контроля: scope-валидация (CIDR/wildcard/regex), классификация инструментов по опасности (SAFE/INTRUSIVE/DESTRUCTIVE), per-target rate limiter, kill switch, audit log в SQLite и персистентные пентест-сессии с CVSS-скорингом и markdown-отчётами. Также 300 новых тестов (всего 415).
 
 Далее предполагается, что HexStrike и OpenCode у вас уже установлены (читайте мою статью).
 
@@ -20,7 +20,8 @@
 8. [Изменения в hexstrike_mcp.py](#изменения-в-hexstrike_mcpy)
 9. [Транспорт и оптимизация](#транспорт-и-оптимизация-v630)
 10. [Тесты и разработка](#тесты-и-разработка)
-11. [Синхронизация с upstream](#синхронизация-с-upstream)
+11. [Guardrails и сессии (v6.4.0)](#guardrails-и-сессии-v640)
+12. [Синхронизация с upstream](#синхронизация-с-upstream)
 
 ---
 
@@ -329,7 +330,105 @@ pytest --no-cov   # без покрытия (быстрее)
 ### CI
 
 GitHub Actions (`.github/workflows/ci.yml`, Python 3.13) прогоняет `pytest` на каждый
-push в `master` и на pull request.
+push в `master` и на pull request. С v6.4.0 используются actions на Node.js 24
+(`checkout@v6`, `setup-python@v6`) — без deprecated-предупреждений Node 20.
+
+---
+
+## Guardrails и сессии (v6.4.0)
+
+Релиз v6.4.0 добавляет слой безопасности и контроля над действиями агента.
+
+### Архитектура
+
+Новый пакет `hexstrike_guardrails/` + модуль `pentest_session.py` подключаются
+к `hexstrike_server.py` автоматически (см. `_register_optional_blueprints()`
+в конце `hexstrike_server.py`). Если пакет недоступен — сервер стартует без
+guardrails (graceful fallback). Все данные хранятся в SQLite
+(`data/hexstrike_sessions.db`, gitignored), переживают рестарт.
+
+### Компоненты
+
+| Компонент | Файл | Назначение |
+|---|---|---|
+| `ScopeValidator` | `hexstrike_guardrails/scope.py` | Контроль области: CIDR/wildcard/regex/hostname |
+| `Tier`, `classify_tool` | `hexstrike_guardrails/tiers.py` | Классификация 144 инструментов: SAFE/INTRUSIVE/DESTRUCTIVE |
+| `TargetRateLimiter` | `hexstrike_guardrails/rate_limiter.py` | Per-target concurrency + rps caps |
+| `KillSwitch` | `hexstrike_guardrails/killswitch.py` | Аварийная остановка процессов (SIGTERM → SIGKILL) |
+| `AuditLogger` | `hexstrike_guardrails/audit.py` | Append-only журнал в SQLite |
+| `GuardrailsState` | `hexstrike_guardrails/state.py` | Оркестратор (singleton) |
+| `register_guardrails(app)` | `hexstrike_guardrails/blueprint.py` | Flask Blueprint + 9 эндпоинтов |
+| `PentestSessionManager` | `pentest_session.py` | Персистентные сессии, находки, отчёты |
+
+### Конфигурация через env
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `GUARDRAILS_DB` | `data/hexstrike_sessions.db` | Путь к SQLite-базе |
+| `GUARDRAILS_MAX_CONCURRENT` | `5` | Лимит одновременных запросов на цель |
+| `GUARDRAILS_MAX_RPS` | `10` | Лимит запросов в секунду на цель |
+| `GUARDRAILS_RATE_TIMEOUT` | `0.0` | Таймаут блокирующего acquire (сек) |
+| `GUARDRAILS_AUTOCONFIRM` | `0` | `1` = destructive-инструменты без подтверждения |
+
+### Scope-валидация
+
+```bash
+# Установить scope (по умолчанию пусто = allow-all)
+curl -X PUT http://127.0.0.1:8888/api/guardrails/scope \
+  -H "Content-Type: application/json" \
+  -d '{"rules": ["192.168.0.0/16", "example.com", "*.corp"]}'
+
+# Проверить таргет
+curl -X POST http://127.0.0.1:8888/api/guardrails/validate \
+  -H "Content-Type: application/json" \
+  -d '{"target": "192.168.1.5"}'
+# {"in_scope": true, "matched_rule": "192.168.0.0/16", ...}
+```
+
+Поддерживаемые форматы правил:
+- CIDR: `192.168.0.0/24`, `::1/128`
+- Bare IP: `10.0.0.5` (трактуется как `/32`)
+- Wildcard: `*.example.com`
+- Regex: `r:^.*\.internal$` (cap 256 символов против ReDoS)
+- Hostname: `example.com` (exact match, case-insensitive)
+
+### Пентест-сессии
+
+```bash
+# Создать сессию
+curl -X POST http://127.0.0.1:8888/api/session/create \
+  -H "Content-Type: application/json" \
+  -d '{"target": "example.com", "scope_rules": ["example.com"]}'
+# {"session_id": "abc123...", ...}
+
+# Добавить находку (CVSS считается автоматически)
+curl -X POST http://127.0.0.1:8888/api/session/abc123/finding \
+  -H "Content-Type: application/json" \
+  -d '{"tool": "sqlmap", "vuln_type": "sqli", "title": "Login bypass",
+       "endpoint": "/login", "evidence": "..."}'
+# {"cvss_score": 9.8, "severity": "critical", ...}
+
+# Сгенерировать отчёт
+curl -s "http://127.0.0.1:8888/api/session/abc123/report?format=markdown" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['report'])"
+```
+
+### Kill switch
+
+```bash
+# Аварийно остановить все процессы
+curl -X POST http://127.0.0.1:8888/api/guardrails/kill-all -d '{"reason":"emergency"}'
+
+# Сбросить флаг
+curl -X POST http://127.0.0.1:8888/api/guardrails/reset
+```
+
+### Health-панель
+
+Секция `/health` расширена тремя блоками: **GUARDRAILS** (kill switch state,
+rate limits, scope pills, tier distribution), **RECENT SESSIONS** (severity
+breakdown), **RECENT AUDIT** (последние события с tier-бейджами). В верхней
+панели появилась stat-card Kill Switch (IDLE/ENGAGED).
 
 ---
 
