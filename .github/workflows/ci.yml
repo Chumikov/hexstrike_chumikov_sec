@@ -16,10 +16,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        # v6+ runs on Node.js 24 (v5 was the first to adopt Node 24).
+        # Eliminates the "Node.js 20 actions are deprecated" warning.
+        uses: actions/checkout@v6
 
       - name: Set up Python 3.13
-        uses: actions/setup-python@v5
+        # v6+ runs on Node.js 24 (matches the checkout bump).
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
@@ -33,7 +36,7 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Run tests with coverage
-        # Green pytest only in v6.3.0 — no hard coverage gate yet.
+        # Green pytest only — no hard coverage gate yet.
         # The --cov-fail-under threshold (>=70%) arrives in T6 / v7.0.0.
         run: pytest
 
