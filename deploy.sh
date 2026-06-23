@@ -107,6 +107,35 @@ else
     fail "hexstrike_optimizer.py не найден в ${SCRIPT_DIR} (нужен hexstrike_mcp.py)"
 fi
 
+# v6.4.0+: guardrails package + pentest sessions + SQLite schema
+if [[ -d "${SCRIPT_DIR}/hexstrike_guardrails" ]]; then
+    rm -rf "${HEXSTRIKE_DIR}/hexstrike_guardrails"
+    cp -a "${SCRIPT_DIR}/hexstrike_guardrails" "${HEXSTRIKE_DIR}/hexstrike_guardrails"
+    ok "hexstrike_guardrails/ скопирован ($(find ${HEXSTRIKE_DIR}/hexstrike_guardrails -name '*.py' | wc -l) .py)"
+else
+    warn "hexstrike_guardrails/ не найден — guardrails отключены (сервер поднимется без них)"
+fi
+
+if [[ -f "${SCRIPT_DIR}/pentest_session.py" ]]; then
+    cp "${SCRIPT_DIR}/pentest_session.py" "${HEXSTRIKE_DIR}/pentest_session.py"
+    ok "pentest_session.py скопирован"
+else
+    warn "pentest_session.py не найден — /api/session/* отключены"
+fi
+
+if [[ -d "${SCRIPT_DIR}/schemas" ]]; then
+    mkdir -p "${HEXSTRIKE_DIR}/schemas"
+    cp -a "${SCRIPT_DIR}/schemas/." "${HEXSTRIKE_DIR}/schemas/"
+    ok "schemas/ скопирован"
+else
+    warn "schemas/ не найден — guardrails создаст БД без DDL (упадёт при первом запросе)"
+fi
+
+# Runtime data directory for SQLite (gitignored; create empty + writable)
+mkdir -p "${HEXSTRIKE_DIR}/data"
+chown "$(detect_user):$(id -gn "$(detect_user)")" "${HEXSTRIKE_DIR}/data" 2>/dev/null || true
+ok "data/ подготовлен (SQLite создастся при первом запросе)"
+
 if [[ -d "${SCRIPT_DIR}/templates" ]]; then
     mkdir -p "${HEXSTRIKE_DIR}/templates"
     cp -a "${SCRIPT_DIR}/templates/." "${HEXSTRIKE_DIR}/templates/"
