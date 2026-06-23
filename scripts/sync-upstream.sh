@@ -12,9 +12,10 @@
 #   3. Выполняет merge upstream/master (--allow-unrelated-histories, т.к. репо
 #      независимое, а не GitHub-fork).
 #   4. АВТОМАТИЧЕСКИ защищает наш набор (восстанавливает из HEAD): deploy.sh,
-#      VERSION, CHANGELOG.md, templates/, requirements.txt, OpenCodeStart.sh,
-#      hexstrike_mcp.py, hexstrike_optimizer.py, Develop_Plan.md, scripts/,
-#      tests/, .github/, pytest.ini, requirements-dev.txt.
+#      VERSION, CHANGELOG.md, templates/, requirements.txt, requirements-dev.txt,
+#      OpenCodeStart.sh, hexstrike_mcp.py, hexstrike_optimizer.py,
+#      hexstrike_guardrails/, pentest_session.py, schemas/, scripts/, tests/,
+#      .github/, pytest.ini, .gitignore, Develop_Plan.md.
 #   5. НЕ трогает hexstrike_server.py — оставляет conflict-маркеры для ручного
 #      ревью (там наши правки health-панели).
 #   6. Генерирует MERGE_UPSTREAM_REPORT.md.
@@ -42,6 +43,9 @@ PROTECTED=(
     "OpenCodeStart.sh"
     "hexstrike_mcp.py"
     "hexstrike_optimizer.py"
+    "hexstrike_guardrails"
+    "pentest_session.py"
+    "schemas"
     "Develop_Plan.md"
     "scripts"
     "tests"
