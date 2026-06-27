@@ -5,6 +5,40 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/),
 версионирование — [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [6.4.5] — 2026-06-27
+
+### Добавлено
+
+- **MCP-консолидация по принципу «один глагол на класс задач» (C1+C2):** 6 новых MCP-инструментов-глаголов, заменяющих 14 специфичных тулов
+  - `port_scan(target, mode, ports, tool)` ← `nmap_scan` + `nmap_advanced_scan` + `rustscan_fast_scan` (mode=fast/full/stealth/udp, auto→rustscan/nmap)
+  - `subdomain_enum(domain, source, tool)` ← `amass_scan` + `subfinder_scan` (source=passive/active/all)
+  - `http_probe(url, mode, depth, tool)` ← `httpx_probe` + `katana_crawl` (mode=probe/crawl/tech-detect)
+  - `directory_brute(url, mode, wordlist, tool)` ← `gobuster_scan` + `ffuf_scan` + `dirsearch_scan` (mode=dir/vhost/fuzz)
+  - `web_vuln_scan(target, profile, intensity, tool)` ← `nuclei_scan` + `nikto_scan` + покрывает `wpscan` (profile=generic/cms/legacy/wordpress)
+  - `cloud_audit(scope, tool)` ← `prowler_scan` + `trivy_scan` + внутри диспетчерит на `kube-hunter`/`checkov` (scope=aws/k8s/docker/iac/all)
+  - Каждый глагол — тонкая диспетчерская обёртка над **существующими** `/api/tools/*` роутами; бизнес-логика не дублируется
+- **`metasploit_run` (C3) — закрытие destructive-gap'а:** новый first-class MCP-инструмент для Metasploit, обязательная маркировка `tier=DESTRUCTIVE` в `TOOL_TIERS`. Закрывает критический зазор, когда metasploit был доступен только через `execute_command` и обходил guardrails (v6.4.0). После инцидента с бронированием отелей 2026-06-23 — этический дифференциатор
+- **`HEXSTRIKE_MCP_PROFILE` env var (C4) — server-side фильтрация инструментов:** 5 профилей (`minimal`/`recon`/`web`/`exploit`/`full`), работает в любом MCP-клиенте (OpenCode, Claude Desktop, Cursor, Cline). Не зависит от Anthropic quasi-static (который не работает в связке с GLM/OpenAI-compatible API). Дополнительно `HEXSTRIKE_MCP_ALIASES=0` прячет 14 deprecated имён
+  - minimal=4 тула (~1 300 токенов), recon=7 (~2 400), web=9 (~3 100), exploit=13 (~3 900), full+aliases=32 (по умолчанию, обратная совместимость)
+- **Принцип 6 в `Develop_Plan.md`:** «MCP-экономика: один глагол на класс задач» — зафиксирована методология
+
+### Изменено
+
+- **Расширение `hexstrike_guardrails/tiers.py`:** новые глаголы классифицированы — `subdomain_enum`/`http_probe`/`cloud_audit` → SAFE; `port_scan`/`directory_brute`/`web_vuln_scan` → INTRUSIVE; `metasploit_run` → DESTRUCTIVE. `metasploit` уже был в destructive, добавлено MCP-имя `metasploit_run`
+- **14 старых инструментов помечены `[DEPRECATED v6.4.5, use XXX. Removed in v6.5.0]`** в docstring'ах (C5). Регистрируются только в `full` профиле при `HEXSTRIKE_MCP_ALIASES=1` (default). Удаляются в первом PR v6.5.0
+- **`hexstrike_mcp.py` (+~340 строк):** profile-mechanism в начале `setup_mcp_server` (`_reg`, `_reg_alias`, `_tool` helper), 7 новых глаголов, условная регистрация всех существующих тулов через `@_tool(name, alias=.../full_only=...)`
+
+### Тесты
+
+- **41 новый тест в `tests/unit/test_mcp_v645_consolidation.py`** (T-c): проверка профилей (4/7/9/13 тулов), deprecated docstrings (14 алиасов), диспетчеризация глаголов (port_scan→nmap-advanced/rustscan/masscan, directory_brute→ffuf, subdomain_enum→subfinder, web_vuln_scan→wpscan, cloud_audit→kube-hunter), tier-классификация новых глаголов, metasploit_run как DESTRUCTIVE
+- **Обновлён `test_tool_schemas.py`:** count 25 → 32 (25 legacy + 7 new verbs), добавлен `test_v645_new_verbs_present`
+- **Всего: 415 → 456 тестов, все зелёные.** Регрессий v6.3.0/v6.4.0 нет
+
+### Совместимость
+
+- **100% backward compat:** default `HEXSTRIKE_MCP_PROFILE=full + HEXSTRIKE_MCP_ALIASES=1` сохраняет все 25 существующих имён + добавляет 7 новых = 32 инструмента. Существующие AGENTS.md, сохранённые диалоги, кастомные промпты работают без изменений
+- **Token savings opt-in:** `HEXSTRIKE_MCP_PROFILE=recon` снижает нагрузку системного промпта на ~59% (5 832 → ~2 400 токенов на каждом ходе диалога)
+
 ## [6.4.0] — 2026-06-22
 
 ### Добавлено

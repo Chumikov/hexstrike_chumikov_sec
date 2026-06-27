@@ -73,6 +73,8 @@ _SAFE_TOOLS: frozenset[str] = frozenset({
     # --- MCP meta / agent utilities (never touch a target) -------------------
     "batch_execute", "get_mcp_stats", "clear_mcp_cache", "server_health",
     "list_files",
+    # --- v6.4.5 NEW passive verbs --------------------------------------------
+    "subdomain_enum", "http_probe", "cloud_audit",
     # --- Passive recon (DNS / certificate transparency / APIs) ---------------
     "subfinder", "subfinder_scan", "amass", "amass_passive",
     "httpx", "httpx_probe", "analyze_target_intelligence",
@@ -94,6 +96,8 @@ _INTRUSIVE_TOOLS: frozenset[str] = frozenset({
     "nmap_scan", "gobuster_scan", "nuclei_scan", "prowler_scan", "trivy_scan",
     "nikto_scan", "ffuf_scan", "ffuf", "amass_scan", "dirsearch_scan",
     "rustscan_fast_scan", "intelligent_smart_scan",
+    # --- v6.4.5 NEW active verbs ---------------------------------------------
+    "port_scan", "directory_brute", "web_vuln_scan",
     # --- Essential network/web scanners --------------------------------------
     "nmap", "gobuster", "dirb", "nikto", "masscan", "rustscan", "autorecon",
     "nbtscan", "arp-scan", "nxc", "netexec", "enum4linux", "enum4linux-ng",
@@ -110,6 +114,7 @@ _DESTRUCTIVE_TOOLS: frozenset[str] = frozenset({
     # --- MCP destructive -----------------------------------------------------
     "sqlmap_scan", "hydra_attack", "execute_command", "create_file",
     "nmap_advanced_scan",  # default; see classify_tool for aggressive override
+    "metasploit_run",  # v6.4.5 — new destructive verb, gated by guardrails
     # --- Exploit / cred harvesting -------------------------------------------
     "sqlmap", "hydra", "medusa", "patator", "john", "hashcat", "hashcat-utils",
     "metasploit", "msfvenom", "msfconsole", "responder", "evil-winrm",

@@ -701,7 +701,238 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
                      port: int = DEFAULT_MCP_PORT) -> FastMCP:
     mcp = FastMCP("hexstrike-ai-mcp", host=host, port=port)
 
-    @mcp.tool()
+    # =========================================================================
+    # v6.4.5 «Streamline» — profile-based tool registration (C4)
+    # =========================================================================
+    # Profiles control WHICH verb tools get registered (token budget).
+    # Aliases (old specific tool names) are gated separately by HEXSTRIKE_MCP_ALIASES.
+    #
+    # Default (no env): profile=full + aliases=1 → all new verbs + all old names
+    #                   (backward compatible, similar token load to v6.4.0)
+    # Lean:    HEXSTRIKE_MCP_PROFILE=recon      → only 7 tools (~2 400 tok)
+    # Modern:  HEXSTRIKE_MCP_PROFILE=full HEXSTRIKE_MCP_ALIASES=0 → 13 tools (~4 000 tok)
+    _MINIMAL = {"execute_command", "intelligent_smart_scan",
+                "analyze_target_intelligence", "batch_execute"}
+    _RECON = _MINIMAL | {"port_scan", "subdomain_enum", "http_probe"}
+    _WEB = _RECON | {"directory_brute", "web_vuln_scan"}
+    _EXPLOIT = _WEB | {"sqlmap_scan", "hydra_attack", "metasploit_run", "cloud_audit"}
+    _PROFILES = {"minimal": _MINIMAL, "recon": _RECON, "web": _WEB,
+                 "exploit": _EXPLOIT, "full": None}  # None = no filter
+
+    profile = os.environ.get("HEXSTRIKE_MCP_PROFILE", "full").lower()
+    _allowed = _PROFILES.get(profile, None)  # unknown → None → no filter (safe default)
+    _aliases_on = os.environ.get("HEXSTRIKE_MCP_ALIASES", "1") != "0"
+
+    def _reg(name: str) -> bool:
+        """Return True if a NEW verb tool should be registered under current profile."""
+        return _allowed is None or name in _allowed
+
+    def _reg_alias(name: str) -> bool:
+        """Return True if a DEPRECATED alias should be registered (only in `full` profile)."""
+        return _aliases_on and _allowed is None
+
+    def _tool(name: str, alias: bool = False, full_only: bool = False):
+        """Conditional decorator: register tool only if profile allows.
+
+        - alias=True    → deprecated alias (only in `full` profile + HEXSTRIKE_MCP_ALIASES=1)
+        - full_only=True → rare meta tool (only in `full` profile, independent of aliases flag)
+        - default       → new verb tool, profile-gated via _reg()
+        """
+        if full_only:
+            should = (_allowed is None)
+        elif alias:
+            should = _reg_alias(name)
+        else:
+            should = _reg(name)
+        if should:
+            return mcp.tool()
+        # Identity decorator — function gets defined but NOT registered with FastMCP.
+        return lambda func: func
+
+    if profile != "full" or not _aliases_on:
+        logger.info(f"🎛️  MCP profile={profile!r}, aliases={_aliases_on} "
+                    f"(tools registered: {len(_allowed) if _allowed else 'all'})")
+
+    # =========================================================================
+    # v6.4.5 NEW VERBS (C1+C2+C3) — «один глагол на класс задач»
+    # Каждый глагол — thin dispatcher over existing /api/tools/* routes.
+    # =========================================================================
+
+    @_tool("port_scan")
+    def port_scan(
+        target: Annotated[str, Field(description="Target IP, hostname, or CIDR (e.g. '192.168.1.0/24')")],
+        mode: Annotated[str, Field(description="Scan mode: 'fast' (top-1000, ~5s) | 'full' (-sV -sC) | 'stealth' (-sS SYN) | 'udp' (-sU top UDP)")] = "fast",
+        ports: Annotated[str, Field(description="Specific ports: '80,443' or '1-1000' (empty = default)")] = "",
+        tool: Annotated[str, Field(description="Force scanner: 'auto' (default) | 'nmap' | 'masscan' | 'rustscan'")] = "auto",
+    ) -> Dict[str, Any]:
+        """
+        Scan TCP/UDP ports of a target. Auto-selects optimal scanner based on mode:
+        fast → rustscan · full → nmap (-sV -sC) · stealth → nmap (-sS) · udp → nmap (-sU).
+        Override with tool= param.
+        """
+        if tool == "auto":
+            tool = {"fast": "rustscan", "full": "nmap", "stealth": "nmap", "udp": "nmap"}.get(mode, "nmap")
+        if tool == "rustscan":
+            endpoint, data = "api/tools/rustscan", {"target": target, "ports": ports, "ulimit": 5000}
+        elif tool == "masscan":
+            endpoint, data = "api/tools/masscan", {"target": target, "ports": ports or "1-65535", "rate": 1000}
+        elif tool == "nmap":
+            if mode == "udp":
+                endpoint, data = "api/tools/nmap", {"target": target, "scan_type": "-sU", "ports": ports or "top-50", "additional_args": ""}
+            elif mode == "stealth":
+                endpoint, data = "api/tools/nmap", {"target": target, "scan_type": "-sS", "ports": ports, "additional_args": ""}
+            else:
+                endpoint, data = "api/tools/nmap-advanced", {"target": target, "scan_type": "-sV -sC", "ports": ports, "additional_args": ""}
+        else:
+            return {"success": False, "error": f"Unknown tool={tool!r}. Use auto/nmap/masscan/rustscan."}
+        logger.info(f"🔌 port_scan: target={target}, mode={mode}, tool={tool}")
+        return hexstrike_client.safe_post(endpoint, data)
+
+    @_tool("subdomain_enum")
+    def subdomain_enum(
+        domain: Annotated[str, Field(description="Root domain to enumerate (e.g. 'example.com')")],
+        source: Annotated[str, Field(description="'passive' (subfinder, no target traffic) | 'active' (amass) | 'all' (both sequentially)")] = "passive",
+        tool: Annotated[str, Field(description="Force: 'auto' | 'amass' | 'subfinder'")] = "auto",
+    ) -> Dict[str, Any]:
+        """
+        Enumerate subdomains of a domain. Passive=subfinder (no packets to target),
+        active=amass, all=both. Override with tool= param.
+        """
+        if tool == "auto":
+            tool = {"passive": "subfinder", "active": "amass", "all": "subfinder"}.get(source, "subfinder")
+        results = []
+        tools_to_run = [tool] if tool != "all" and source != "all" else ["subfinder", "amass"]
+        if source == "all":
+            tools_to_run = ["subfinder", "amass"]
+        for t in tools_to_run:
+            endpoint = "api/tools/subfinder" if t == "subfinder" else "api/tools/amass"
+            logger.info(f"🌐 subdomain_enum: domain={domain}, tool={t}")
+            r = hexstrike_client.safe_post(endpoint, {"domain": domain, "source": "all" if t == "subfinder" else "active"})
+            results.append({"tool": t, "result": r})
+        return {"success": all(r["result"].get("success") for r in results), "results": results}
+
+    @_tool("http_probe")
+    def http_probe(
+        url: Annotated[str, Field(description="Target URL, hostname, or file with hosts")],
+        mode: Annotated[str, Field(description="'probe' (liveness+tech) | 'crawl' (spider with katana) | 'tech-detect' (fingerprint)")],
+        depth: Annotated[int, Field(description="Crawl depth (mode=crawl only)")] = 2,
+        tool: Annotated[str, Field(description="Force: 'auto' | 'httpx' | 'katana'")] = "auto",
+    ) -> Dict[str, Any]:
+        """
+        Probe HTTP targets: liveness/tech-detection (httpx) or crawling (katana).
+        Auto-selects: probe/tech-detect → httpx, crawl → katana.
+        """
+        if tool == "auto":
+            tool = "katana" if mode == "crawl" else "httpx"
+        if tool == "httpx":
+            return hexstrike_client.safe_post("api/tools/httpx", {"target": url, "mode": mode})
+        elif tool == "katana":
+            return hexstrike_client.safe_post("api/tools/katana", {"url": url, "depth": depth, "js_crawl": True, "form_extraction": True})
+        return {"success": False, "error": f"Unknown tool={tool!r}. Use auto/httpx/katana."}
+
+    @_tool("directory_brute")
+    def directory_brute(
+        url: Annotated[str, Field(description="Target URL (e.g. 'https://example.com')")],
+        mode: Annotated[str, Field(description="'dir' (directories) | 'vhost' (virtual hosts) | 'fuzz' (fuzzing)")] = "dir",
+        wordlist: Annotated[str, Field(description="Path to wordlist")] = "/usr/share/wordlists/dirb/common.txt",
+        tool: Annotated[str, Field(description="Force: 'auto' | 'gobuster' | 'ffuf' | 'dirsearch'")] = "auto",
+    ) -> Dict[str, Any]:
+        """
+        Brute-force directories, vhosts, or fuzz endpoints.
+        Auto-selects: dir/vhost → gobuster, fuzz → ffuf.
+        """
+        if tool == "auto":
+            tool = "ffuf" if mode == "fuzz" else "gobuster"
+        endpoints = {"gobuster": "api/tools/gobuster", "ffuf": "api/tools/ffuf", "dirsearch": "api/tools/dirsearch"}
+        if tool not in endpoints:
+            return {"success": False, "error": f"Unknown tool={tool!r}. Use auto/gobuster/ffuf/dirsearch."}
+        data = {"url": url, "mode": mode, "wordlist": wordlist, "additional_args": ""}
+        logger.info(f"📁 directory_brute: url={url}, mode={mode}, tool={tool}")
+        return hexstrike_client.safe_post(endpoints[tool], data)
+
+    @_tool("web_vuln_scan")
+    def web_vuln_scan(
+        target: Annotated[str, Field(description="Target URL or IP")],
+        profile: Annotated[str, Field(description="'generic' (nuclei) | 'cms' (auto-detect) | 'legacy' (nikto) | 'wordpress' (wpscan)")] = "generic",
+        intensity: Annotated[str, Field(description="'passive' | 'active'")] = "active",
+        tool: Annotated[str, Field(description="Force: 'auto' | 'nuclei' | 'nikto' | 'wpscan'")] = "auto",
+    ) -> Dict[str, Any]:
+        """
+        Web vulnerability scanner. Auto-selects by profile:
+        generic→nuclei · cms→nuclei+cms-tags · legacy→nikto · wordpress→wpscan.
+        """
+        if tool == "auto":
+            tool = {"generic": "nuclei", "cms": "nuclei", "legacy": "nikto", "wordpress": "wpscan"}.get(profile, "nuclei")
+        if tool == "nuclei":
+            tags = "cms" if profile == "cms" else ""
+            return hexstrike_client.safe_post("api/tools/nuclei", {"target": target, "tags": tags, "severity": "", "template": "", "additional_args": ""})
+        elif tool == "nikto":
+            return hexstrike_client.safe_post("api/tools/nikto", {"target": target, "additional_args": ""})
+        elif tool == "wpscan":
+            return hexstrike_client.safe_post("api/tools/wpscan", {"url": target, "additional_args": ""})
+        return {"success": False, "error": f"Unknown tool={tool!r}. Use auto/nuclei/nikto/wpscan."}
+
+    @_tool("cloud_audit")
+    def cloud_audit(
+        scope: Annotated[str, Field(description="'aws' | 'azure' | 'gcp' | 'k8s' | 'docker' | 'iac' | 'all'")] = "aws",
+        tool: Annotated[str, Field(description="Force: 'auto' | 'prowler' | 'trivy' | 'kube-hunter' | 'checkov'")] = "auto",
+    ) -> Dict[str, Any]:
+        """
+        Cloud/infrastructure security audit. Auto-selects by scope:
+        aws→prowler · k8s→kube-hunter · docker→trivy · iac→checkov · all→sequential.
+        """
+        if tool == "auto":
+            tool = {"aws": "prowler", "k8s": "kube-hunter", "docker": "trivy", "iac": "checkov"}.get(scope, "prowler")
+        if scope == "all":
+            results = []
+            for t, ep, payload in [
+                ("prowler", "api/tools/prowler", {"provider": "aws"}),
+                ("trivy", "api/tools/trivy", {"scan_type": "fs", "target": "."}),
+                ("kube-hunter", "api/tools/kube-hunter", {}),
+                ("checkov", "api/tools/checkov", {}),
+            ]:
+                logger.info(f"☁️  cloud_audit all: running {t}")
+                results.append({"tool": t, "result": hexstrike_client.safe_post(ep, payload)})
+            return {"success": True, "results": results}
+        dispatch = {
+            "prowler": ("api/tools/prowler", {"provider": scope if scope in ("aws", "azure", "gcp") else "aws"}),
+            "trivy": ("api/tools/trivy", {"scan_type": "fs", "target": "."}),
+            "kube-hunter": ("api/tools/kube-hunter", {}),
+            "checkov": ("api/tools/checkov", {}),
+        }
+        if tool not in dispatch:
+            return {"success": False, "error": f"Unknown tool={tool!r}."}
+        ep, payload = dispatch[tool]
+        logger.info(f"☁️  cloud_audit: scope={scope}, tool={tool}")
+        return hexstrike_client.safe_post(ep, payload)
+
+    @_tool("metasploit_run")
+    def metasploit_run(
+        module: Annotated[str, Field(description="MSF module path, e.g. 'exploit/windows/smb/ms17_010_eternalblue'")],
+        target: Annotated[str, Field(description="Target RHOSTS (IP/CIDR/hostname). MUST be inside active guardrails scope.")],
+        options: Annotated[str, Field(description='JSON options: {"LHOST":"10.0.0.1","LPORT":4444}')],
+    ) -> Dict[str, Any]:
+        """
+        [DESTRUCTIVE] Execute a Metasploit module. Subject to guardrails scope+tier
+        checks on the server side (v6.4.0). Will be BLOCKED if target is outside
+        active scope or if tier=destructive is not permitted in current session.
+        """
+        try:
+            opts = json.loads(options) if isinstance(options, str) else (options or {})
+        except json.JSONDecodeError as e:
+            return {"success": False, "error": f"Invalid JSON options: {e}"}
+        payload = {"module": module, "target": target, "options": opts, "use_recovery": True}
+        logger.warning(f"⚠️  DESTRUCTIVE: metasploit_run module={module}, target={target}")
+        result = hexstrike_client.safe_post("api/tools/metasploit", payload, use_cache=False)
+        if not result.get("success"):
+            logger.error(f"❌ metasploit_run failed or blocked: {result.get('error', 'unknown')}")
+        return result
+
+    # =========================================================================
+    # EXISTING TOOLS (now conditionally registered via @_tool / aliases)
+    # =========================================================================
+
+    @_tool("batch_execute")
     def batch_execute(
         requests: Annotated[str, Field(description='JSON string: list of requests, each {"endpoint": "...", "method": "POST", "data": {...}}')],
         max_concurrent: Annotated[int, Field(description="Maximum number of concurrent requests")] = 5,
@@ -728,7 +959,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ Batch execution failed: {str(e)}")
             return {"error": str(e), "success": False}
 
-    @mcp.tool()
+    @_tool("get_mcp_stats", full_only=True)
     def get_mcp_stats() -> Dict[str, Any]:
         """
         Get MCP client statistics including cache, rate limiter, and request metrics.
@@ -740,7 +971,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         logger.info("📊 Retrieved MCP client statistics")
         return stats
 
-    @mcp.tool()
+    @_tool("clear_mcp_cache", full_only=True)
     def clear_mcp_cache(
         pattern: Annotated[str, Field(description="Optional pattern to match cache keys (empty = clear all)")] = "",
     ) -> Dict[str, Any]:
@@ -757,7 +988,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         logger.info(f"🧹 Cleared MCP cache: {result['invalidated_entries']} entries")
         return result
 
-    @mcp.tool()
+    @_tool("nmap_scan", alias=True)
     def nmap_scan(
         target: Annotated[str, Field(description="The IP address or hostname to scan")],
         scan_type: Annotated[str, Field(description="Scan type (e.g. -sV version detection, -sC scripts)")] = "-sV",
@@ -765,6 +996,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         additional_args: Annotated[str, Field(description="Additional Nmap arguments")] = "",
     ) -> Dict[str, Any]:
         """
+        [DEPRECATED v6.4.5, use port_scan. Removed in v6.5.0] 
         Execute an enhanced Nmap scan against a target with real-time logging.
 
         Args:
@@ -785,7 +1017,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"{HexStrikeColors.ERROR}❌ Nmap scan failed for {target}{HexStrikeColors.RESET}")
         return result
 
-    @mcp.tool()
+    @_tool("gobuster_scan", alias=True)
     def gobuster_scan(
         url: Annotated[str, Field(description="The target URL")],
         mode: Annotated[str, Field(description="Scan mode (dir, dns, fuzz, vhost)")] = "dir",
@@ -793,6 +1025,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         additional_args: Annotated[str, Field(description="Additional Gobuster arguments")] = "",
     ) -> Dict[str, Any]:
         """
+        [DEPRECATED v6.4.5, use directory_brute. Removed in v6.5.0] 
         Execute Gobuster to find directories, DNS subdomains, or virtual hosts.
 
         Args:
@@ -813,7 +1046,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"{HexStrikeColors.ERROR}❌ Gobuster scan failed for {url}{HexStrikeColors.RESET}")
         return result
 
-    @mcp.tool()
+    @_tool("nuclei_scan", alias=True)
     def nuclei_scan(
         target: Annotated[str, Field(description="The target URL or IP")],
         severity: Annotated[str, Field(description="Filter by severity (critical,high,medium,low,info)")] = "",
@@ -822,6 +1055,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         additional_args: Annotated[str, Field(description="Additional Nuclei arguments")] = "",
     ) -> Dict[str, Any]:
         """
+        [DEPRECATED v6.4.5, use web_vuln_scan. Removed in v6.5.0] 
         Execute Nuclei vulnerability scanner with enhanced logging.
 
         Args:
@@ -843,7 +1077,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"{HexStrikeColors.ERROR}❌ Nuclei scan failed for {target}{HexStrikeColors.RESET}")
         return result
 
-    @mcp.tool()
+    @_tool("prowler_scan", alias=True)
     def prowler_scan(
         provider: Annotated[str, Field(description="Cloud provider (aws, azure, gcp)")] = "aws",
         profile: Annotated[str, Field(description="AWS/Cloud profile to use")] = "default",
@@ -854,6 +1088,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         additional_args: Annotated[str, Field(description="Additional Prowler arguments")] = "",
     ) -> Dict[str, Any]:
         """
+        [DEPRECATED v6.4.5, use cloud_audit. Removed in v6.5.0] 
         Execute Prowler for comprehensive cloud security assessment.
 
         Args:
@@ -878,7 +1113,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ Prowler assessment failed")
         return result
 
-    @mcp.tool()
+    @_tool("trivy_scan", alias=True)
     def trivy_scan(
         scan_type: Annotated[str, Field(description="Type of scan (image, fs, repo, config)")] = "image",
         target: Annotated[str, Field(description="Target to scan (image name, directory, repository)")] = "",
@@ -888,6 +1123,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         additional_args: Annotated[str, Field(description="Additional Trivy arguments")] = "",
     ) -> Dict[str, Any]:
         """
+        [DEPRECATED v6.4.5, use cloud_audit. Removed in v6.5.0] 
         Execute Trivy for container and filesystem vulnerability scanning.
 
         Args:
@@ -911,12 +1147,13 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ Trivy scan failed for {target}")
         return result
 
-    @mcp.tool()
+    @_tool("nikto_scan", alias=True)
     def nikto_scan(
         target: Annotated[str, Field(description="The target URL or IP")],
         additional_args: Annotated[str, Field(description="Additional Nikto arguments")] = "",
     ) -> Dict[str, Any]:
         """
+        [DEPRECATED v6.4.5, use web_vuln_scan. Removed in v6.5.0] 
         Execute Nikto web vulnerability scanner.
 
         Args:
@@ -935,7 +1172,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ Nikto scan failed for {target}")
         return result
 
-    @mcp.tool()
+    @_tool("sqlmap_scan")
     def sqlmap_scan(
         url: Annotated[str, Field(description="The target URL")],
         data: Annotated[str, Field(description="POST data for testing")] = "",
@@ -961,7 +1198,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ SQLMap scan failed for {url}")
         return result
 
-    @mcp.tool()
+    @_tool("hydra_attack")
     def hydra_attack(
         target: Annotated[str, Field(description="The target IP or hostname")],
         service: Annotated[str, Field(description="The service to attack (ssh, ftp, http, etc.)")],
@@ -996,7 +1233,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ Hydra attack failed for {target}")
         return result
 
-    @mcp.tool()
+    @_tool("ffuf_scan", alias=True)
     def ffuf_scan(
         url: Annotated[str, Field(description="The target URL")],
         wordlist: Annotated[str, Field(description="Wordlist file to use")] = "/usr/share/wordlists/dirb/common.txt",
@@ -1005,6 +1242,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         additional_args: Annotated[str, Field(description="Additional FFuf arguments")] = "",
     ) -> Dict[str, Any]:
         """
+        [DEPRECATED v6.4.5, use directory_brute. Removed in v6.5.0] 
         Execute FFuf for web fuzzing.
 
         Args:
@@ -1026,13 +1264,14 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ FFuf fuzzing failed for {url}")
         return result
 
-    @mcp.tool()
+    @_tool("amass_scan", alias=True)
     def amass_scan(
         domain: Annotated[str, Field(description="The target domain")],
         mode: Annotated[str, Field(description="Amass mode (enum, intel, viz)")] = "enum",
         additional_args: Annotated[str, Field(description="Additional Amass arguments")] = "",
     ) -> Dict[str, Any]:
         """
+        [DEPRECATED v6.4.5, use subdomain_enum. Removed in v6.5.0] 
         Execute Amass for subdomain enumeration.
 
         Args:
@@ -1052,7 +1291,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ Amass failed for {domain}")
         return result
 
-    @mcp.tool()
+    @_tool("subfinder_scan", alias=True)
     def subfinder_scan(
         domain: Annotated[str, Field(description="The target domain")],
         silent: Annotated[bool, Field(description="Run in silent mode")] = True,
@@ -1060,6 +1299,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         additional_args: Annotated[str, Field(description="Additional Subfinder arguments")] = "",
     ) -> Dict[str, Any]:
         """
+        [DEPRECATED v6.4.5, use subdomain_enum. Removed in v6.5.0] 
         Execute Subfinder for passive subdomain enumeration.
 
         Args:
@@ -1080,7 +1320,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ Subfinder failed for {domain}")
         return result
 
-    @mcp.tool()
+    @_tool("httpx_probe", alias=True)
     def httpx_probe(
         target: Annotated[str, Field(description="Target file or single URL")],
         probe: Annotated[bool, Field(description="Enable probing")] = True,
@@ -1093,6 +1333,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         additional_args: Annotated[str, Field(description="Additional httpx arguments")] = "",
     ) -> Dict[str, Any]:
         """
+        [DEPRECATED v6.4.5, use http_probe. Removed in v6.5.0] 
         Execute httpx for fast HTTP probing and technology detection.
 
         Args:
@@ -1120,7 +1361,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ httpx probe failed for {target}")
         return result
 
-    @mcp.tool()
+    @_tool("dirsearch_scan", alias=True)
     def dirsearch_scan(
         url: Annotated[str, Field(description="The target URL")],
         extensions: Annotated[str, Field(description="File extensions to search for")] = "php,html,js,txt,xml,json",
@@ -1130,6 +1371,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         additional_args: Annotated[str, Field(description="Additional Dirsearch arguments")] = "",
     ) -> Dict[str, Any]:
         """
+        [DEPRECATED v6.4.5, use directory_brute. Removed in v6.5.0] 
         Execute Dirsearch for advanced directory and file discovery.
 
         Args:
@@ -1153,7 +1395,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ Dirsearch scan failed for {url}")
         return result
 
-    @mcp.tool()
+    @_tool("katana_crawl", alias=True)
     def katana_crawl(
         url: Annotated[str, Field(description="The target URL to crawl")],
         depth: Annotated[int, Field(description="Crawling depth")] = 3,
@@ -1163,6 +1405,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         additional_args: Annotated[str, Field(description="Additional Katana arguments")] = "",
     ) -> Dict[str, Any]:
         """
+        [DEPRECATED v6.4.5, use http_probe. Removed in v6.5.0] 
         Execute Katana for next-generation crawling and spidering.
 
         Args:
@@ -1187,7 +1430,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ Katana crawl failed for {url}")
         return result
 
-    @mcp.tool()
+    @_tool("nmap_advanced_scan", alias=True)
     def nmap_advanced_scan(
         target: Annotated[str, Field(description="The target IP address or hostname")],
         scan_type: Annotated[str, Field(description="Nmap scan type (e.g. -sS, -sT, -sU)")] = "-sS",
@@ -1201,6 +1444,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         additional_args: Annotated[str, Field(description="Additional Nmap arguments")] = "",
     ) -> Dict[str, Any]:
         """
+        [DEPRECATED v6.4.5, use port_scan. Removed in v6.5.0] 
         Execute advanced Nmap scans with custom NSE scripts and optimized timing.
 
         Args:
@@ -1230,7 +1474,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ Advanced Nmap failed for {target}")
         return result
 
-    @mcp.tool()
+    @_tool("rustscan_fast_scan", alias=True)
     def rustscan_fast_scan(
         target: Annotated[str, Field(description="The target IP address or hostname")],
         ports: Annotated[str, Field(description='Specific ports to scan (e.g. "22,80,443")')] = "",
@@ -1241,6 +1485,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         additional_args: Annotated[str, Field(description="Additional Rustscan arguments")] = "",
     ) -> Dict[str, Any]:
         """
+        [DEPRECATED v6.4.5, use port_scan. Removed in v6.5.0] 
         Execute Rustscan for ultra-fast port scanning.
 
         Args:
@@ -1265,7 +1510,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ Rustscan failed for {target}")
         return result
 
-    @mcp.tool()
+    @_tool("server_health", full_only=True)
     def server_health() -> Dict[str, Any]:
         """
         Check the health status of the HexStrike AI server.
@@ -1281,7 +1526,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.warning(f"⚠️  Server health check returned: {result.get('status', 'unknown')}")
         return result
 
-    @mcp.tool()
+    @_tool("execute_command")
     def execute_command(
         command: Annotated[str, Field(description="The command to execute")],
         use_cache: Annotated[bool, Field(description="Whether to use caching")] = True,
@@ -1310,7 +1555,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"💥 Error executing command: {str(e)}")
             return {"success": False, "error": str(e), "stdout": "", "stderr": f"Error: {str(e)}"}
 
-    @mcp.tool()
+    @_tool("intelligent_smart_scan")
     def intelligent_smart_scan(
         target: Annotated[str, Field(description="Target to scan")],
         objective: Annotated[str, Field(description='Scanning objective: "comprehensive", "quick", or "stealth"')] = "comprehensive",
@@ -1336,7 +1581,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"{HexStrikeColors.ERROR}❌ Intelligent scan failed for {target}{HexStrikeColors.RESET}")
         return result
 
-    @mcp.tool()
+    @_tool("analyze_target_intelligence")
     def analyze_target_intelligence(
         target: Annotated[str, Field(description="Target URL, IP address, or domain to analyze")],
     ) -> Dict[str, Any]:
@@ -1359,7 +1604,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ Target analysis failed for {target}")
         return result
 
-    @mcp.tool()
+    @_tool("create_file", full_only=True)
     def create_file(
         filename: Annotated[str, Field(description="Name of the file to create")],
         content: Annotated[str, Field(description="Content to write to the file")],
@@ -1385,7 +1630,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ Failed to create file: {filename}")
         return result
 
-    @mcp.tool()
+    @_tool("list_files", full_only=True)
     def list_files(
         directory: Annotated[str, Field(description="Directory to list (relative to server's base directory)")] = ".",
     ) -> Dict[str, Any]:

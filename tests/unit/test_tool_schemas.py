@@ -1,4 +1,4 @@
-"""Regression test for MCP tool inputSchemas (F3, v6.3.0).
+"""Regression test for MCP tool inputSchemas (F3, v6.3.0; updated v6.4.5).
 
 Locks in two properties discovered during the F3 audit:
 1. Every tool exposes a valid JSON-Schema `inputSchema` (type=object, proper
@@ -7,8 +7,13 @@ Locks in two properties discovered during the F3 audit:
 2. Every parameter carries a human-readable `description` (via Annotated/Field),
    so the agent understands each argument. FastMCP does NOT parse docstring
    `Args:` blocks, so descriptions must be supplied explicitly.
+
+v6.4.5 update: count is now 32 = 25 legacy tools + 7 new verbs
+(`port_scan`, `subdomain_enum`, `http_probe`, `directory_brute`,
+`web_vuln_scan`, `cloud_audit`, `metasploit_run`).
 """
 import asyncio
+import os
 
 import pytest
 
@@ -17,7 +22,10 @@ import hexstrike_mcp
 
 @pytest.fixture(scope="module")
 def tools():
-    """All registered MCP tools (introspected once per module)."""
+    """All registered MCP tools (introspected once per module) under default profile."""
+    # Force default profile (full + aliases on) for stable count regardless of env.
+    os.environ.pop("HEXSTRIKE_MCP_PROFILE", None)
+    os.environ.pop("HEXSTRIKE_MCP_ALIASES", None)
     class _DummyClient:
         pass
     mcp = hexstrike_mcp.setup_mcp_server(_DummyClient())
@@ -25,9 +33,19 @@ def tools():
 
 
 def test_all_tools_registered(tools):
-    # 25 tools in the trimmed mcp.py; guard against accidental drops.
+    # v6.4.0: 25 tools. v6.4.5: 32 = 25 legacy + 7 new verbs (port_scan, etc.).
     names = {t.name for t in tools}
-    assert len(names) == 25, f"expected 25 tools, got {len(names)}: {sorted(names)}"
+    assert len(names) == 32, f"expected 32 tools, got {len(names)}: {sorted(names)}"
+
+
+def test_v645_new_verbs_present(tools):
+    """All 7 new verbs from v6.4.5 must be registered in default profile."""
+    names = {t.name for t in tools}
+    expected_verbs = {"port_scan", "subdomain_enum", "http_probe",
+                      "directory_brute", "web_vuln_scan", "cloud_audit",
+                      "metasploit_run"}
+    missing = expected_verbs - names
+    assert not missing, f"missing v6.4.5 verbs: {missing}"
 
 
 def test_input_schemas_are_valid_jsonschema(tools):
