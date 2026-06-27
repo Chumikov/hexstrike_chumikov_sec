@@ -2,7 +2,7 @@
 
 В своей статье https://habr.com/ru/articles/985450/ я рассмотрел интеграцию Hexstrike-AI и OpenCode в Kali Linux. С того времени вышло много обновлений OpenCode и всего пара патчей безопасности для HexStrike, а работа связки оставалась крайне нестабильной и местами медленной. Ждать обещанную 7-ю версию HexStrike (которая, судя по всему, не выйдет в open-source) я не стал — и начал развивать собственный форк.
 
-Текущая версия: **v6.4.0 «Guardrails»**. Релиз добавляет слой безопасности и контроля: scope-валидация (CIDR/wildcard/regex), классификация инструментов по опасности (SAFE/INTRUSIVE/DESTRUCTIVE), per-target rate limiter, kill switch, audit log в SQLite и персистентные пентест-сессии с CVSS-скорингом и markdown-отчётами. Также 300 новых тестов (всего 415).
+Текущая версия: **v6.4.5 «Streamline»** (включает всё из не публиковавшейся ранее v6.4.0 «Guardrails»). Релиз добавляет слой guardrails (scope-валидация, классификация 144 инструментов по SAFE/INTRUSIVE/DESTRUCTIVE, per-target rate limiter, kill switch, audit log в SQLite, персистентные сессии с CVSS-скорингом и markdown-отчётами), а также консолидирует 14 близнецов-инструментов в 6 «глаголов» (`port_scan`, `subdomain_enum`, `http_probe`, `directory_brute`, `web_vuln_scan`, `cloud_audit`), добавляет `metasploit_run` под guardrails и env-профили `HEXSTRIKE_MCP_PROFILE` для экономии токенов. Всего **456 тестов** (+41 к v6.4.0).
 
 Далее предполагается, что HexStrike и OpenCode у вас уже установлены (читайте мою статью).
 
@@ -21,7 +21,8 @@
 9. [Транспорт и оптимизация](#транспорт-и-оптимизация-v630)
 10. [Тесты и разработка](#тесты-и-разработка)
 11. [Guardrails и сессии (v6.4.0)](#guardrails-и-сессии-v640)
-12. [Синхронизация с upstream](#синхронизация-с-upstream)
+12. [MCP-консолидация и профили (v6.4.5)](#mcp-консолидация-и-профили-v645)
+13. [Синхронизация с upstream](#синхронизация-с-upstream)
 
 ---
 
@@ -223,7 +224,7 @@ curl -s http://127.0.0.1:8888/health?json | python3 -c "import sys,json; print(j
 
 Изменения развёртываются автоматически скриптом `deploy.sh`.
 
-> Всего MCP-инструментов: **25**. Изменения v6.3.0 (альтернативные транспорты, оптимизатор контекста, описания параметров, фикс health-check) — в разделе [«Транспорт и оптимизация»](#транспорт-и-оптимизация-v630).
+> Всего MCP-инструментов по умолчанию: **32** (25 legacy + 7 глаголов v6.4.5). Сокращается через `HEXSTRIKE_MCP_PROFILE` — см. [MCP-консолидация и профили (v6.4.5)](#mcp-консолидация-и-профили-v645). Изменения v6.3.0 (альтернативные транспорты, оптимизатор контекста, описания параметров, фикс health-check) — в разделе [«Транспорт и оптимизация»](#транспорт-и-оптимизация-v630).
 
 ### Асинхронные запросы
 
@@ -325,7 +326,7 @@ sudo systemctl enable --now hexstrike-mcp   # поднимает MCP на :9010
 
 ## Тесты и разработка
 
-Начиная с v6.3.0 проект покрыт unit-тестами (pytest) на «чистые» функции без I/O. В v6.4.0 тестовое покрытие масштабно расширено: добавлены тесты на весь пакет `hexstrike_guardrails/`, `pentest_session.py` и на legacy-эксплойт-генераторы. Всего **415 тестов** (115 → 415, +300).
+Начиная с v6.3.0 проект покрыт unit-тестами (pytest) на «чистые» функции без I/O. В v6.4.0 тестовое покрытие масштабно расширено: добавлены тесты на весь пакет `hexstrike_guardrails/`, `pentest_session.py` и на legacy-эксплойт-генераторы. В v6.4.5 добавлены тесты на MCP-консолидацию (профили, глаголы, алиасы, guardrails для metasploit). Всего **456 тестов** (115 → 415 → 456).
 
 ### Установка dev-зависимостей
 
@@ -471,6 +472,61 @@ curl -s "http://127.0.0.1:8888/api/session/abc123/report?format=markdown" \
 ### Health-панель
 
 `/health` расширен тремя новыми секциями: **GUARDRAILS** (kill switch state, rate limits, scope pills, tier distribution), **RECENT SESSIONS** (severity breakdown), **RECENT AUDIT** (последние события с tier-бейджами). В верхней панели появилась stat-card Kill Switch (IDLE/ENGAGED).
+
+---
+
+## MCP-консолидация и профили (v6.4.5)
+
+Релиз v6.4.5 «Streamline» решает три проблемы сразу: агент мог запустить скан «не туда» (теперь guardrails из v6.4.0 блокируют), перегрузить цель дублирующими инструментами (теперь глаголы вместо близнецов), или просто сожрать половину контекстного окна LLM описаниями тулов (теперь `HEXSTRIKE_MCP_PROFILE`).
+
+### 6 «глаголов» вместо 14 близнецов
+
+Раньше 14 MCP-инструментов делали почти одно и то же (3 разные тулы для скана портов, 3 для брутфорса директорий, и т.д.). Теперь — по одному глаголу на класс задач, с параметром `tool=auto` (по умолчанию сервер сам выбирает оптимальный CLI):
+
+| Глагол | Заменяет | Что делает |
+|---|---|---|
+| `port_scan` | nmap / nmap-advanced / rustscan / masscan | Скан портов (mode=fast/full/stealth/udp) |
+| `subdomain_enum` | amass / subfinder | Поддомены (source=passive/active/all) |
+| `http_probe` | httpx / katana | HTTP liveness / краулинг / tech-detect |
+| `directory_brute` | gobuster / ffuf / dirsearch | Брутфорс директорий / vhost / fuzzing |
+| `web_vuln_scan` | nuclei / nikto / wpscan | Веб-уязвимости (profile=generic/cms/legacy/wordpress) |
+| `cloud_audit` | prowler / trivy / kube-hunter / checkov | Аудит облака (scope=aws/k8s/docker/iac/all) |
+
+Каждый глагол — тонкая диспетчерская обёртка над уже существующими `/api/tools/*` роутами; бизнес-логика не дублируется. Старые имена (`nmap_scan`, `gobuster_scan` и 12 других) сохранены как deprecated aliases до v6.5.0.
+
+### `metasploit_run` под guardrails
+
+Новый first-class MCP-инструмент для Metasploit с явной маркировкой `tier=DESTRUCTIVE`. Ранее metasploit был доступен только через `execute_command` (свободный shell-вызов) и **обходил guardrails** — критический зазор в этическом позиционировании, особенно после инцидента с бронированием отелей 2026-06-23 (когда HexStrike+Claude использовали для реальной атаки). Теперь `metasploit_run` требует активного scope и tier=destructive; вызов вне scope блокируется до выполнения, audit-лог пишется всегда.
+
+### `HEXSTRIKE_MCP_PROFILE` — экономия токенов
+
+Server-side фильтрация инструментов через env-переменную. Работает в любом MCP-клиенте (OpenCode, Claude Desktop, Cursor, Cline), не зависит от Anthropic quasi-static (которое не работает с OpenAI-compatible API вроде GLM-5.2).
+
+| Профиль | Инструментов | ~Токенов | Назначение |
+|---|---|---|---|
+| `minimal` | 4 | ~1 300 | 4 meta: execute / smart_scan / analyze / batch |
+| `recon` | 7 | ~2 400 | + `port_scan`, `subdomain_enum`, `http_probe` |
+| `web` | 9 | ~3 100 | + `directory_brute`, `web_vuln_scan` |
+| `exploit` | 13 | ~3 900 | + `sqlmap`, `hydra`, `metasploit_run`, `cloud_audit` |
+| `full` (default) | 13 новых + 14 aliases = 32 | ~6 500 | Обратная совместимость |
+
+Дополнительно `HEXSTRIKE_MCP_ALIASES=0` прячет 14 deprecated имён даже в `full`, оставляя только 13 современных глаголов (~4 000 токенов).
+
+Пример OpenCode config с lean-профилем:
+
+```jsonc
+"mcp": {
+  "hexstrike": {
+    "type": "local",
+    "command": ["python", "hexstrike_mcp.py"],
+    "environment": { "HEXSTRIKE_MCP_PROFILE": "recon" }
+  }
+}
+```
+
+### Совместимость
+
+На 100% обратно совместимо. Default поведение (`HEXSTRIKE_MCP_PROFILE=full + HEXSTRIKE_MCP_ALIASES=1`) сохраняет все 25 существующих имён инструментов + добавляет 7 новых = 32. Существующие AGENTS.md, сохранённые диалоги, кастомные промпты работают без изменений. Экономия токенов — **opt-in** через lean-профили.
 
 ---
 
