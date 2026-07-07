@@ -18,6 +18,18 @@ HEXSTRIKE_PORT=8888
 WORKERS=2
 TIMEOUT=300
 MAX_REQUESTS=1000
+# OOM-resilience: лимиты масштабируются по RAM хоста (вариант A).
+# MAX = 30% RAM, clamped [1800, 6000] MB; HIGH = 65% от MAX.
+# Override: HEXSTRIKE_MEM_HIGH / HEXSTRIKE_MEM_MAX (напр. "4000M").
+TOTAL_RAM_KB=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo)
+TOTAL_RAM_KB="${TOTAL_RAM_KB:-0}"
+TOTAL_RAM_MB=$(( TOTAL_RAM_KB / 1024 ))
+MEM_MAX_DEFAULT_MB=$(( TOTAL_RAM_MB * 30 / 100 ))
+if (( MEM_MAX_DEFAULT_MB < 1800 )); then MEM_MAX_DEFAULT_MB=1800; fi
+if (( MEM_MAX_DEFAULT_MB > 6000 )); then MEM_MAX_DEFAULT_MB=6000; fi
+MEM_HIGH_DEFAULT_MB=$(( MEM_MAX_DEFAULT_MB * 65 / 100 ))
+MEM_HIGH="${HEXSTRIKE_MEM_HIGH:-${MEM_HIGH_DEFAULT_MB}M}"
+MEM_MAX="${HEXSTRIKE_MEM_MAX:-${MEM_MAX_DEFAULT_MB}M}"
 VENV_DIR="${HEXSTRIKE_DIR}/venv"
 
 STEP=0
@@ -269,14 +281,21 @@ WorkingDirectory=${HEXSTRIKE_DIR}
 Environment="${SYSTEMD_PATH}"
 ExecStart=${GUNICORN_WRAPPER} --bind 127.0.0.1:${HEXSTRIKE_PORT} --workers ${WORKERS} --timeout ${TIMEOUT} --max-requests ${MAX_REQUESTS} hexstrike_server:app
 ExecReload=/bin/kill -s HUP \$MAINPID
-Restart=on-failure
-RestartSec=5
+Restart=always
+RestartSec=3
+OOMPolicy=continue
+OOMScoreAdjust=-500
+MemoryHigh=${MEM_HIGH}
+MemoryMax=${MEM_MAX}
+TimeoutStopSec=15
+KillSignal=SIGINT
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 ok "Файл ${SERVICE_FILE} создан"
+ok "MemoryHigh=${MEM_HIGH} MemoryMax=${MEM_MAX} (RAM ~${TOTAL_RAM_MB}M, 30%→MAX/65%→HIGH)"
 
 # ============================================================================
 
@@ -393,8 +412,9 @@ Environment="MCP_TRANSPORT=${MCP_TRANSPORT_DEFAULT}"
 Environment="MCP_HOST=127.0.0.1"
 Environment="MCP_PORT=${MCP_PORT}"
 ExecStart=${VENV_PYTHON} ${HEXSTRIKE_DIR}/hexstrike_mcp.py
-Restart=on-failure
-RestartSec=5
+Restart=always
+RestartSec=3
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target

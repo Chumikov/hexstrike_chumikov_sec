@@ -12,13 +12,30 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
     exit 1
 fi
 
+HEALTH_RETRIES="${HEALTHSTART_RETRIES:-30}"
+HEALTH_INTERVAL="${HEALTHSTART_INTERVAL:-1}"
+
 check_server() { curl -s -f "$HEALTH_URL" > /dev/null 2>&1; }
+
+wait_health() {
+    local i
+    for ((i = 1; i <= HEALTH_RETRIES; i++)); do
+        if check_server; then
+            return 0
+        fi
+        sleep "$HEALTH_INTERVAL"
+    done
+    return 1
+}
 
 if ! check_server; then
     systemctl start hexstrike 2>/dev/null || \
     "$GUNICORN_WRAPPER" --bind 127.0.0.1:8888 --workers 2 \
         --chdir /usr/share/hexstrike-ai --daemon hexstrike_server:app
-    sleep 2
+    if ! wait_health; then
+        echo "[OpenCodeStart] HexStrike не поднялся за $((HEALTH_RETRIES * HEALTH_INTERVAL))с — MCP stdio запускается без живого бэкенда." >&2
+        echo "[OpenCodeStart] Диагностика: systemctl status hexstrike ; journalctl -u hexstrike -n 50" >&2
+    fi
 fi
 
 # Принудительно stdio для этой точки входа (F2, v6.3.0): даже если в окружении

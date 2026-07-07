@@ -5,6 +5,24 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/),
 версионирование — [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [6.4.6] — 2026-07-07
+
+### Изменено
+
+- **OOM-харденинг systemd-unit'а `hexstrike.service`** (deploy.sh) — защита от инцидента, когда gunicorn-воркеры убивались OOM-киллером под нагрузкой CTF, MCP stdio рвался, а после ребута сервер не поднимался вовремя:
+  - `Restart=on-failure` → `Restart=always`, `RestartSec=5` → `3`
+  - `OOMPolicy=continue` — воркер, убитый OOM, пересоздаётся master'ом, юнит не падает целиком
+  - `OOMScoreAdjust=-500` — понижает приоритет hexstrike как жертвы kernel OOM-киллера
+  - `MemoryHigh` / `MemoryMax` — **масштабируются по RAM хоста** (30% RAM → MemoryMax, clamped [1800, 6000] MB; 65% от MAX → MemoryHigh). HexStrike троттлит/перезапускает сам себя вместо того, чтобы утянуть всю машину в OOM-ребут
+  - `TimeoutStopSec=15`, `KillSignal=SIGINT` — чище shutdown
+  - Override через env: `HEXSTRIKE_MEM_HIGH` / `HEXSTRIKE_MEM_MAX` (напр. `4000M`)
+- **`OpenCodeStart.sh`: retry-loop проверки `/health`** вместо `sleep 2`. После ребута systemd поднимает hexstrike за ~5–25 с; старый `sleep 2` срабатывал раньше готовности → opencode фиксировал `server unavailable key=hexstrike`. Теперь лаунчер ждёт до 30×1 с (параметризуется `HEALTHSTART_RETRIES` / `HEALTHSTART_INTERVAL`) с диагностикой в stderr при провале
+- `hexstrike-mcp.service` (опциональный streamable/sse): `Restart=always`, `RestartSec=3`, `OOMScoreAdjust=-500`
+
+### Безопасность
+
+- Корни правок — аудит логов CTF-уикенда (4–5 июля 2026): gunicorn-воркеры убивались SIGKILL в 23:06/23:11 4 июля, машина ребутилась дважды 5 июля (~4,5 ч оффлайна), MCP-сервер не переподключался, доля hexstrike-вызовов падала с 11% до 3% из-за вымывания tool-определений при компактизации контекста. Текущие правки адресуют memory/OOM/restart; поведенческая часть (compaction → prefer hexstrike_*) закрывается в ctfd-api skill (§7a).
+
 ## [6.4.5] — 2026-06-27
 
 ### Добавлено

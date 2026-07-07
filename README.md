@@ -93,7 +93,7 @@ curl http://127.0.0.1:8888/health
 
 - 2 worker-процесса вместо одного — параллельная обработка запросов, один долгий скан не блокирует API
 - Автоперезапуск worker'ов после 1000 запросов (`--max-requests`) — защита от утечек памяти
-- systemd-интеграция — автозапуск при загрузке, автоматический рестарт при падении (`Restart=on-failure`)
+- systemd-интеграция — автозапуск при загрузке, `Restart=always`, `OOMPolicy=continue`, `OOMScoreAdjust=-500`, RAM-scaled `MemoryHigh`/`MemoryMax` (v6.4.6, см. `deploy.sh`)
 - Graceful reload — `kill -HUP` перезапускает worker'ов без даунтайма
 - Таймаут 300с на уровне сервера — защита от зависших запросов
 
