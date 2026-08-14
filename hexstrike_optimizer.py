@@ -15,8 +15,14 @@ hexstrike_optimizer.py — оптимизация контекста/токен�
 Конфигурация через переменные окружения:
 - MCP_OPTIMIZER_ENABLED   (true/false, по умолчанию true)
 - MCP_OPTIMIZER_MAX_CHARS (целое, по умолчанию 20000)
-- MCP_OPTIMIZER_DEDUP     (true/false, по умолчанию true)
+- MCP_OPTIMIZER_DEDUP     (true/false, по умолчанию false — см. _dedup_lines)
 - MCP_OPTIMIZER_STRIP_ANSI(true/false, по умолчанию true)
+
+Дедупликация по умолчанию ВЫКЛЮЧЕНА: схлопывание повторяющихся строк
+тихо искажает позиционно-значимые данные (ASCII-битмапы, hex-дампы,
+таблицы), где одинаковые строки семантически нагружены. Включайте
+MCP_OPTIMIZER_DEDUP=true только для заведомо текстового вывода (логи,
+листы хостов); маркер вставляется ровно на месте схлопнутого блока.
 """
 from __future__ import annotations
 
@@ -41,7 +47,7 @@ class OutputOptimizer:
         self,
         enabled: bool = True,
         max_chars: int = 20000,
-        dedup: bool = True,
+        dedup: bool = False,
         strip_ansi: bool = True,
         min_chars_to_process: int = 1000,
     ):
@@ -62,7 +68,7 @@ class OutputOptimizer:
         return cls(
             enabled=_as_bool(os.getenv("MCP_OPTIMIZER_ENABLED", "true"), True),
             max_chars=int(os.getenv("MCP_OPTIMIZER_MAX_CHARS", "20000")),
-            dedup=_as_bool(os.getenv("MCP_OPTIMIZER_DEDUP", "true"), True),
+            dedup=_as_bool(os.getenv("MCP_OPTIMIZER_DEDUP", "false"), False),
             strip_ansi=_as_bool(os.getenv("MCP_OPTIMIZER_STRIP_ANSI", "true"), True),
         )
 
@@ -149,21 +155,30 @@ class OutputOptimizer:
 
     @staticmethod
     def _dedup_lines(text: str) -> str:
+        """Схлопнуть ПОДРЯД идущие одинаковые строки.
+
+        Маркер «⟨×N⟩» вставляется ровно на месте схлопнутого блока (а не
+        одной строкой в хвосте, как раньше) — позиционная структура вывода
+        (битмапы, дампы) остаётся интерпретируемой. Выключена по умолчанию:
+        для позиционно-значимых данных любая дедупликация разрушительна.
+        """
         lines = text.split("\n")
         if len(lines) <= 1:
             return text
         result = []
         prev = None
-        removed = 0
+        run = 0  # сколько одинаковых строк за текущей уже отброшено
         for line in lines:
             if line == prev:
-                removed += 1
+                run += 1
                 continue
+            if run:
+                result.append(f"⟨×{run + 1} identical lines⟩")
+                run = 0
             result.append(line)
             prev = line
-        if removed:
-            # Сигнализируем о дедупликации, не искажая содержимое.
-            result.append(f"\n[duplicate lines removed: {removed}]")
+        if run:
+            result.append(f"⟨×{run + 1} identical lines⟩")
         return "\n".join(result)
 
     def _truncate(self, text: str) -> str:

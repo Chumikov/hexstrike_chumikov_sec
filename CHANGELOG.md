@@ -5,6 +5,38 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/),
 версионирование — [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [6.4.8] — 2026-08-14
+
+Фиксы по отчёту полевых испытаний v6.4.7 (CTF-уикенд на ctf.bug-makers.ru): 4 подтверждённых бага + наблюдение об audit-покрытии.
+
+### Исправлено
+
+- **BUG-1 (высокая): `http_probe` неработоспособен при конфликте бинарника httpx.** Роут `/api/tools/httpx` строил команду `httpx -l <target>` — синтаксис projectdiscovery/httpx (Go); в системах, где имя `httpx` перехватывает Python-клиент (Kali-пакет `python3-httpx`, `pip install httpx`), любой вызов падал с `Error: No such option: -l`, при этом health-check рапортовал `httpx: true` (проверял существование, не функциональность). Теперь:
+  - `resolve_httpx_binary()` функционально различает диалекты по выводу help (`-status-code`/`-tech-detect` → PD; `<URL> [OPTIONS]` / `[OPTIONS] URL` → Python), результат кэшируется на воркер; env-override `HEXSTRIKE_HTTPX_BIN`
+  - PD-вариант: argv-форма (`shell=False`, заодно закрыт injection через этот роут), цели подаются через stdin, PD-диалект флагов (`-status-code`/`-content-length`/`-web-server` вместо легаси `-sc`/`-cl`/`-server`)
+  - Python-вариант: fallback — URL позиционно, ответ помечается `fallback: python-httpx`; `mode=tech-detect` возвращает 501 с подсказкой `go install github.com/projectdiscovery/httpx/cmd/httpx@latest`
+  - `http_probe` MCP-глагол: `mode` теперь реально маппится на флаги сервером (раньше игнорировался)
+- **BUG-2 (высокая): `port_scan(mode=full)` выполнял broadcast-скрипты вне зоны цели и зависал.** Дефолт `--script=default,discovery,safe` в `/api/tools/nmap-advanced` тянул категорию `discovery` → pre-scan скрипты (`targets-sniffer`, `broadcast-*`, `eap-info`, …) слали L2-broadcast/multicast трафик и сниффили соседей независимо от цели (утечка топологии, нарушение scope-модели), а часть падала с ошибками. Наблюдавшийся таймаут 300 c на 3 портах. Теперь:
+  - дефолтный набор скриптов — `default,safe`; `--script-exclude=broadcast` добавляется всегда (в т.ч. к пользовательским наборам)
+  - границы времени: `--host-timeout=2m`, `--script-timeout=30s` — один «залипший» скрипт не съедает бюджет вызова
+  - роут переведён на argv-форму с allowlist-валидацией `scan_type`/`ports`/`timing`/`nse_scripts` (заодно закрыт injection через `scan_type`/`nse_scripts`)
+- **BUG-3 (средняя): дедупликация оптимизатора искажала структурированные данные.** Схлопывание подряд идущих одинаковых строк молча ломало позиционно-значимый вывод (ASCII-битмапы глифов «съедались» с 19 до 5–7 строк → ложные гипотезы при анализе), маркер удаления стоял в хвосте, а не на месте. Теперь:
+  - `dedup` по умолчанию **выключен** (`MCP_OPTIMIZER_DEDUP=false`; opt-in вместо opt-out)
+  - при включении маркер `⟨×N identical lines⟩` вставляется ровно на месте схлопнутого блока
+- **BUG-4 (средняя): отсутствие лимита на объём вывода — runaway-процесс.** Флудящий бинарник (ELF с бесконечным меню при EOF на scanf) исполнялся 1205 c и вернул 94.2 МБ stdout. Теперь:
+  - потолок захвата stdout+stderr (`HEXSTRIKE_MAX_OUTPUT_BYTES`, по умолчанию 10 МБ; per-call override `max_output_bytes` в `/api/command`); при превышении процесс убивается, результат помечается `output_truncated: true` + `partial_results`
+  - строки длиннее 2 КБ не пишутся в `hexstrike.log` (флуд больше не раздувает и лог)
+- **Наблюдение (audit-покрытие): `/api/command` исполнялся вне трассировки guardrails.** 145 команд → 1 запись в audit (только «tiered»-вызовы). Теперь перед исполнением bare-команды выполняется guardrails-check: имя инструмента выводится из бинарника, цель — из первого IP/URL/hostname токена команды; kill switch / scope / rate / tier-гейты и audit-лог покрывают и произвольные команды. Блокировка возвращает структурированный 403/429/503.
+
+### Добавлено
+
+- `EnhancedCommandExecutor`: поддержка `stdin_data` (цели в httpx через stdin, без shell-пайпов); ключ кэша учитывает stdin (одинаковый argv с разными целями больше не схлопываются в кэше)
+
+### Тесты
+
+- +40 (504 → 544, все зелёные): `tests/unit/test_field_fixes.py` (nmap-advanced builder/allowlists, httpx sniff/resolver/flag-mapping, output-cap на реальном flooding-процессе, stdin, `/api/command` под guardrails — audit-строка, block по scope/tier/kill, инференс tool/target), обновлён `test_optimizer.py` под новый дефолт dedup и inline-маркер
+
+
 ## [6.4.7] — 2026-08-11
 
 ### Безопасность (critical/high из аудита)

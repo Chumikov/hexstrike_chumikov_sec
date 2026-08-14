@@ -55,13 +55,40 @@ class TestCarriageReturnCollapse:
 
 
 class TestDedup:
-    def test_consecutive_duplicates_removed(self, opt):
+    def test_consecutive_duplicates_removed_inline_marker(self, opt):
         line = "scanning host 10.0.0.1 ..." + "a" * 30
         text = "\n".join([line] * 5)
         out = opt.optimize({"output": text})
         # The repeated line should appear only once now.
         assert out["output"].count(line) == 1
-        assert "duplicate lines removed: 4" in out["output"]
+        # Inline marker sits right after the collapsed run (BUG-3 fix).
+        assert "⟨×5 identical lines⟩" in out["output"]
+        assert out["output"].rstrip().endswith("⟨×5 identical lines⟩")
+
+    def test_dedup_marker_preserves_position(self, opt):
+        # Bitmap-like structure: blank lines between glyph rows are
+        # semantically loaded — the marker must appear exactly where the
+        # lines were removed, not as a trailing footer.
+        rows = ["###", "###", "...", ".#.", "...", "...", ".#.", "###"]
+        text = "\n".join(rows)
+        out = opt.optimize({"output": text})
+        assert out["output"].startswith("###\n⟨×2 identical lines⟩\n...")
+
+    def test_dedup_disabled_by_default(self):
+        # BUG-3: dedup silently corrupted positional data (bitmaps, dumps),
+        # so it must be opt-in now.
+        o = OutputOptimizer(enabled=True, min_chars_to_process=5)
+        assert o.dedup is False
+        text = "\n".join(["###"] * 8)
+        out = o.optimize({"output": text})
+        assert out["output"] == text
+
+    def test_from_env_dedup_default_off(self, monkeypatch):
+        for var in ("MCP_OPTIMIZER_ENABLED", "MCP_OPTIMIZER_MAX_CHARS",
+                    "MCP_OPTIMIZER_DEDUP", "MCP_OPTIMIZER_STRIP_ANSI"):
+            monkeypatch.delenv(var, raising=False)
+        o = OutputOptimizer.from_env()
+        assert o.dedup is False
 
 
 class TestTruncate:
@@ -125,15 +152,18 @@ class TestFromEnv:
         o = OutputOptimizer.from_env()
         assert o.enabled is True
         assert o.max_chars == 20000
-        assert o.dedup is True
+        assert o.dedup is False
         assert o.strip_ansi is True
 
 
 class TestNmapLikeOutput:
     """Realistic regression: a large nmap-style output gets meaningfully smaller
-    without losing the key findings."""
+    without losing the key findings. Dedup is explicitly ON here (opt-in since
+    the BUG-3 fix) because this scenario — hundreds of identical filler lines —
+    is exactly what it is for."""
     def test_nmap_output_shrinks(self):
-        o = OutputOptimizer(enabled=True, max_chars=2000, min_chars_to_process=100)
+        o = OutputOptimizer(enabled=True, max_chars=2000, dedup=True,
+                            min_chars_to_process=100)
         # Build a noisy output: ANSI + progress + repeated lines + a finding.
         lines = []
         for i in range(200):

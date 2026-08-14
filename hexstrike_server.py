@@ -6871,6 +6871,12 @@ def setup_logging():
 # Configuration (using existing API_PORT from top of file)
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "0").lower() in ("1", "true", "yes", "y")
 COMMAND_TIMEOUT = 300  # 5 minutes default timeout
+
+# Hard cap on captured subprocess output (stdout+stderr, chars). A flooding
+# binary (infinite-loop menu prompt, `yes`, endless log spew) otherwise keeps
+# the executor pinned until the wall timeout while accumulating the full
+# output in memory (observed: 94 MB from one stuck ELF, 20 min lost).
+MAX_OUTPUT_BYTES = int(os.environ.get("HEXSTRIKE_MAX_OUTPUT_BYTES", 10 * 1024 * 1024))
 CACHE_SIZE = 2000  # Increased from 1000 for better performance
 CACHE_TTL = 7200   # Increased from 3600 to 2 hours for stable results
 
@@ -6992,7 +6998,8 @@ telemetry = TelemetryCollector()
 class EnhancedCommandExecutor:
     """Enhanced command executor with caching, progress tracking, and better output handling"""
 
-    def __init__(self, command, timeout: int = COMMAND_TIMEOUT):
+    def __init__(self, command, timeout: int = COMMAND_TIMEOUT,
+                 max_output_bytes: int = None, stdin_data: str = None):
         # command may be either:
         #   - a str        → executed with shell=True  (legacy path; only for
         #                    trusted, already-built commands such as /api/command
@@ -7002,6 +7009,14 @@ class EnhancedCommandExecutor:
         self.command = command
         self.command_argv = isinstance(command, (list, tuple))
         self.timeout = timeout
+        # Output cap: once stdout+stderr exceed this, the process is killed and
+        # the result is flagged output_truncated (BUG-4 runaway-output guard).
+        self.max_output_bytes = (MAX_OUTPUT_BYTES if max_output_bytes is None
+                                 else max(1024, int(max_output_bytes)))
+        self.output_truncated = False
+        self._cap_kill_done = False
+        # Optional stdin payload (e.g. feed the target list to httpx).
+        self.stdin_data = stdin_data
         self.process = None
         self.stdout_data = ""
         self.stderr_data = ""
@@ -7012,25 +7027,66 @@ class EnhancedCommandExecutor:
         self.start_time = None
         self.end_time = None
 
+    def _append_output(self, stream: str, chunk: str) -> bool:
+        """Append captured output honouring the global size cap.
+
+        Returns False when the cap was hit — the caller stops reading and the
+        process gets killed (once) so a flooding child cannot pin the
+        executor for the full wall timeout.
+        """
+        total = len(self.stdout_data) + len(self.stderr_data)
+        if total + len(chunk) > self.max_output_bytes:
+            room = self.max_output_bytes - total
+            if room > 0:
+                if stream == "stdout":
+                    self.stdout_data += chunk[:room]
+                else:
+                    self.stderr_data += chunk[:room]
+            self.output_truncated = True
+            self._kill_on_output_cap()
+            return False
+        if stream == "stdout":
+            self.stdout_data += chunk
+        else:
+            self.stderr_data += chunk
+        return True
+
+    def _kill_on_output_cap(self):
+        if self._cap_kill_done:
+            return
+        self._cap_kill_done = True
+        logger.warning(
+            f"🛑 OUTPUT CAP: {self.max_output_bytes} bytes exceeded — "
+            f"killing PID {self.process.pid if self.process else '?'}"
+        )
+        try:
+            self.process.terminate()
+        except Exception:
+            pass
+
     def _read_stdout(self):
-        """Thread function to continuously read and display stdout"""
+        """Thread function to continuously read stdout"""
         try:
             for line in iter(self.process.stdout.readline, ''):
                 if line:
-                    self.stdout_data += line
-                    # Real-time output display
-                    logger.info(f"📤 STDOUT: {line.strip()}")
+                    if not self._append_output("stdout", line):
+                        return
+                    # Real-time output display (skip very long lines so a
+                    # flooding child cannot also flood hexstrike.log)
+                    if len(line) <= 2000:
+                        logger.info(f"📤 STDOUT: {line.strip()}")
         except Exception as e:
             logger.error(f"Error reading stdout: {e}")
 
     def _read_stderr(self):
-        """Thread function to continuously read and display stderr"""
+        """Thread function to continuously read stderr"""
         try:
             for line in iter(self.process.stderr.readline, ''):
                 if line:
-                    self.stderr_data += line
-                    # Real-time error output display
-                    logger.warning(f"📥 STDERR: {line.strip()}")
+                    if not self._append_output("stderr", line):
+                        return
+                    if len(line) <= 2000:
+                        logger.warning(f"📥 STDERR: {line.strip()}")
         except Exception as e:
             logger.error(f"Error reading stderr: {e}")
 
@@ -7099,9 +7155,17 @@ class EnhancedCommandExecutor:
                 shell=not self.command_argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE if self.stdin_data is not None else None,
                 text=True,
                 bufsize=1
             )
+
+            if self.stdin_data is not None:
+                try:
+                    self.process.stdin.write(self.stdin_data)
+                    self.process.stdin.close()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass  # child exited before reading stdin — fine
 
             pid = self.process.pid
             logger.info(f"🆔 PROCESS: PID {pid} started")
@@ -7162,6 +7226,9 @@ class EnhancedCommandExecutor:
 
                 self.return_code = -1
                 telemetry.record_execution(False, execution_time)
+                # Drain the reader threads so no late write races the result.
+                self.stdout_thread.join(timeout=1)
+                self.stderr_thread.join(timeout=1)
 
             # Always consider it a success if we have output, even with timeout
             success = True if self.timed_out and (self.stdout_data or self.stderr_data) else (self.return_code == 0)
@@ -7193,16 +7260,24 @@ class EnhancedCommandExecutor:
                 if line.strip():
                     logger.info(line)
 
-            return {
+            result = {
                 "stdout": self.stdout_data,
                 "stderr": self.stderr_data,
                 "return_code": self.return_code,
                 "success": success,
                 "timed_out": self.timed_out,
-                "partial_results": self.timed_out and (self.stdout_data or self.stderr_data),
+                "partial_results": (self.timed_out or self.output_truncated) and (self.stdout_data or self.stderr_data),
+                "output_truncated": self.output_truncated,
                 "execution_time": self.end_time - self.start_time if self.end_time else 0,
                 "timestamp": datetime.now().isoformat()
             }
+            if self.output_truncated:
+                result["output_cap_bytes"] = self.max_output_bytes
+                result["note"] = (
+                    "output exceeded the capture cap and the process was killed; "
+                    "raise HEXSTRIKE_MAX_OUTPUT_BYTES or redirect to a file for full output"
+                )
+            return result
 
         except Exception as e:
             self.end_time = time.time()
@@ -8854,7 +8929,8 @@ cve_intelligence = CVEIntelligenceManager()
 exploit_generator = AIExploitGenerator()
 vulnerability_correlator = VulnerabilityCorrelator()
 
-def execute_command(command, use_cache: bool = True) -> Dict[str, Any]:
+def execute_command(command, use_cache: bool = True,
+                    stdin_data: str = None, max_output_bytes: int = None) -> Dict[str, Any]:
     """
     Execute a shell command with enhanced features
 
@@ -8863,16 +8939,23 @@ def execute_command(command, use_cache: bool = True) -> Dict[str, Any]:
             or a list[str] (safe, shell=False). List form is preferred for any
             command built from user-controlled input.
         use_cache: Whether to use caching for this command
+        stdin_data: Optional string written to the child's stdin (e.g. the
+            target list piped into httpx).
+        max_output_bytes: Per-call override of the output capture cap.
 
     Returns:
         A dictionary containing the stdout, stderr, return code, and metadata
     """
     # Normalise the cache key — a list command must hash the same way across
     # calls, so we join with a delimiter that cannot appear inside a token.
+    # stdin_data is part of the key: identical argv with different piped
+    # targets are different commands.
     if isinstance(command, (list, tuple)):
         cache_key = " ".join(map(str, command))
     else:
         cache_key = command
+    if stdin_data is not None:
+        cache_key += "\n<<<stdin>>>\n" + stdin_data
 
     # Check cache first
     if use_cache:
@@ -8881,7 +8964,9 @@ def execute_command(command, use_cache: bool = True) -> Dict[str, Any]:
             return cached_result
 
     # Execute command
-    executor = EnhancedCommandExecutor(command)
+    executor = EnhancedCommandExecutor(
+        command, stdin_data=stdin_data, max_output_bytes=max_output_bytes
+    )
     result = executor.execute()
 
     # Cache successful results
@@ -8891,7 +8976,8 @@ def execute_command(command, use_cache: bool = True) -> Dict[str, Any]:
     return result
 
 def execute_command_with_recovery(tool_name: str, command: str, parameters: Dict[str, Any] = None,
-                                 use_cache: bool = True, max_attempts: int = 3) -> Dict[str, Any]:
+                                 use_cache: bool = True, max_attempts: int = 3,
+                                 stdin_data: str = None, max_output_bytes: int = None) -> Dict[str, Any]:
     """
     Execute a command with intelligent error handling and recovery
 
@@ -8917,7 +9003,8 @@ def execute_command_with_recovery(tool_name: str, command: str, parameters: Dict
 
         try:
             # Execute the command
-            result = execute_command(command, use_cache)
+            result = execute_command(command, use_cache, stdin_data=stdin_data,
+                                     max_output_bytes=max_output_bytes)
 
             # Check if execution was successful
             if result.get("success", False):
@@ -9550,11 +9637,47 @@ def health_check():
         sessions=sessions_ctx,
     )
 
+# Best-effort inference for bare /api/command calls (audit-coverage fix).
+# The guardrails audit only saw calls routed through tiered tool endpoints;
+# arbitrary commands via /api/command executed invisibly. We infer the tool
+# name from the invoked binary and the target from the first IP/URL/hostname
+# token in the command so scope/tier/kill/rate gates and the audit log apply
+# here too.
+_BARE_TARGET_RE = re.compile(
+    r"https?://[^\s'\";|&()<]+"                      # URL
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?\b"    # IPv4 (+CIDR)
+    r"|\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b"  # hostname
+)
+
+
+def _infer_bare_tool(command) -> str:
+    """Tool name for guardrails classification of a bare command."""
+    if isinstance(command, (list, tuple)):
+        first = str(command[0]) if command else ""
+    else:
+        first = str(command).strip().split()[0] if str(command).strip() else ""
+    return os.path.basename(first) or "bare-command"
+
+
+def _infer_bare_target(command) -> Optional[str]:
+    """First IP/URL/hostname token found in the command string, if any."""
+    text = " ".join(map(str, command)) if isinstance(command, (list, tuple)) else str(command)
+    m = _BARE_TARGET_RE.search(text)
+    return m.group(0) if m else None
+
+
 @app.route("/api/command", methods=["POST"])
 def generic_command():
-    """Execute any command provided in the request with enhanced logging"""
+    """Execute any command provided in the request with enhanced logging.
+
+    Unlike tiered tool routes this stays a raw passthrough (legacy shell
+    string form), but since the field-audit finding it now passes a
+    guardrails check first: the invoked binary is inferred as the tool name
+    and the first IP/URL/hostname token as the target, so kill-switch, scope,
+    rate limits and the audit log cover bare commands too.
+    """
     try:
-        params = request.json
+        params = request.json or {}
         command = params.get("command", "")
         use_cache = params.get("use_cache", True)
 
@@ -9564,7 +9687,64 @@ def generic_command():
                 "error": "Command parameter is required"
             }), 400
 
-        result = execute_command(command, use_cache=use_cache)
+        # --- guardrails gate (audit + scope + kill + rate) -----------------
+        tool_name = _infer_bare_tool(command)
+        target = params.get("target") or _infer_bare_target(command)
+        decision = None
+        gr_state = None
+        try:
+            from hexstrike_guardrails import get_state as _gr_get_state
+            gr_state = _gr_get_state()
+        except Exception:
+            gr_state = None  # defensive: run unguarded if guardrails is down
+
+        if gr_state is not None:
+            try:
+                decision = gr_state.check(
+                    tool_name, target, params=params,
+                    session_id=params.get("session_id"),
+                    confirmed=bool(params.get("confirmed", False)),
+                )
+            except Exception:
+                logger.exception("guardrails check failed for /api/command; "
+                                 "proceeding unguarded")
+                decision = None
+            else:
+                if not decision.allowed:
+                    status = {"rate": 429, "kill": 503}.get(decision.reason, 403)
+                    logger.warning(
+                        f"🛑 /api/command blocked by guardrails: "
+                        f"tool={tool_name} target={target} reason={decision.reason}"
+                    )
+                    return jsonify({
+                        "error": "blocked_by_guardrails",
+                        "reason": decision.reason,
+                        "detail": decision.detail,
+                        "tool": tool_name,
+                        "target": target,
+                        "tier": decision.tier.value if decision.tier else None,
+                    }), status
+
+        max_output_bytes = params.get("max_output_bytes")
+        if max_output_bytes is not None:
+            try:
+                max_output_bytes = max(1024, int(max_output_bytes))
+            except (TypeError, ValueError):
+                return jsonify({"error": "max_output_bytes must be an integer"}), 400
+
+        try:
+            result = execute_command(
+                command, use_cache=use_cache,
+                stdin_data=params.get("stdin_data") or None,
+                max_output_bytes=max_output_bytes,
+            )
+        finally:
+            # release the rate-limit slot acquired by the guardrails check
+            if gr_state is not None and decision is not None and decision.allowed and target:
+                try:
+                    gr_state.release_target(target)
+                except Exception:
+                    pass
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in command endpoint: {str(e)}")
@@ -10239,7 +10419,8 @@ def intelligent_smart_scan():
 
 # Helper functions for intelligent smart scan tool execution
 def execute_tool_command(tool_name: str, argv: list, target: str,
-                         params: Dict[str, Any] = None) -> Dict[str, Any]:
+                         params: Dict[str, Any] = None,
+                         stdin_data: str = None) -> Dict[str, Any]:
     """Run a tool via argv list (shell=False) through guardrails.
 
     This is the single safe entry point for smart-scan helpers. It:
@@ -10264,7 +10445,8 @@ def execute_tool_command(tool_name: str, argv: list, target: str,
         return {"success": False, "error": f"invalid target: {exc}"}
     try:
         return execute_command_with_recovery(
-            tool_name, list(argv), params or {"target": target}
+            tool_name, list(argv), params or {"target": target},
+            stdin_data=stdin_data,
         )
     except Exception as exc:
         # GuardrailsBlocked surfaces as a structured dict via the blueprint's
@@ -10408,20 +10590,27 @@ def execute_katana_scan(target, params):
 def execute_httpx_scan(target, params):
     """Execute httpx scan with optimized parameters"""
     try:
-        additional_args = params.get('additional_args', '-tech-detect -status-code')
-        # httpx reads targets from stdin; pass via list-form (no shell pipe).
-        argv = ['httpx'] + _shell_split(additional_args)
-        # Pass target via stdin so no shell pipe is required. We run httpx
-        # directly and feed target on stdin.
+        additional_args = params.get('additional_args', '-status-code -title -tech-detect')
         try:
             target = validate_target(target) if target else target
         except ValueError as exc:
             return {"success": False, "error": f"invalid target: {exc}"}
-        # Use the recovery path but with a small stdin wrapper.
-        result = execute_command_with_recovery(
-            "httpx", argv, {"target": target, **params}
-        )
-        return result
+
+        binary, variant = resolve_httpx_binary()
+        if variant == "pd":
+            # PD httpx reads hosts from stdin
+            argv = [binary] + _shell_split(additional_args)
+            return execute_tool_command("httpx", argv, target, params,
+                                        stdin_data=target + "\n")
+        if variant == "python":
+            # encode/httpx fallback: URL positional
+            url = target if "://" in target else f"http://{target}"
+            return execute_tool_command("httpx", [binary, url], target, params)
+        return {
+            "success": False,
+            "error": "httpx binary not found or not functional",
+            "hint": "go install github.com/projectdiscovery/httpx/cmd/httpx@latest",
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -12100,55 +12289,100 @@ def masscan():
         logger.error(f"💥 Error in masscan endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
+# Validation allowlists for /api/tools/nmap-advanced (BUG-2). scan_type,
+# ports, timing and nse_scripts used to be interpolated into a shell string
+# unrestrained — both an injection vector and the reason a "full" scan could
+# drag in arbitrary NSE categories.
+_NMAP_ALLOWED_SCAN_TYPES = {
+    "-sS", "-sT", "-sU", "-sV", "-sA", "-sW", "-sN", "-sF", "-sX",
+    "-sM", "-sY", "-sZ", "-sO", "-sI", "-sL", "-sC", "-sn",
+}
+_NMAP_PORTS_RE = re.compile(r"^[0-9a-zA-Z,.:+\- ]+$")
+_NMAP_SCRIPTS_RE = re.compile(r"^[a-zA-Z0-9,.+\-/]+$")
+
+
+def build_nmap_advanced_command(params: Dict[str, Any]) -> tuple:
+    """Validate nmap-advanced params and build the argv list.
+
+    Returns (argv, None) on success or (None, error_message) on bad input.
+    Pure function — no I/O, unit-tested in tests/unit/test_field_fixes.py.
+
+    Scope-safety (BUG-2): the default script set is ``default,safe`` — the
+    previous ``default,discovery,safe`` pulled in the broadcast/* NSE family,
+    which shouts into L2 broadcast/multicast and sniffs neighbour traffic
+    regardless of the scanned target. broadcast scripts are additionally
+    excluded explicitly, and per-host / per-script timeouts bound the run.
+    """
+    target = str(params.get("target", "") or "")
+    scan_type = str(params.get("scan_type", "-sS") or "-sS")
+    ports = str(params.get("ports", "") or "")
+    timing = str(params.get("timing", "T4") or "T4")
+    nse_scripts = str(params.get("nse_scripts", "") or "")
+    additional_args = str(params.get("additional_args", "") or "")
+
+    scan_tokens = _shell_split(scan_type)
+    if not scan_tokens or any(tok not in _NMAP_ALLOWED_SCAN_TYPES
+                              for tok in scan_tokens):
+        return None, (f"scan_type must be a combination of "
+                      f"{sorted(_NMAP_ALLOWED_SCAN_TYPES)}")
+    if not re.fullmatch(r"T[0-5]", timing):
+        return None, "timing must be T0..T5"
+    if ports and not _NMAP_PORTS_RE.fullmatch(ports):
+        return None, "ports contains forbidden characters"
+    if nse_scripts and not _NMAP_SCRIPTS_RE.fullmatch(nse_scripts):
+        return None, "nse_scripts contains forbidden characters"
+
+    argv = ["nmap"] + scan_tokens
+    if ports:
+        argv += ["-p", ports]
+    if params.get("stealth"):
+        argv += ["-T2", "-f", "--mtu", "24"]
+    else:
+        argv += [f"-{timing}"]
+    if params.get("os_detection"):
+        argv += ["-O"]
+    if params.get("version_detection"):
+        argv += ["-sV"]
+    if params.get("aggressive"):
+        argv += ["-A"]
+    if nse_scripts:
+        argv += [f"--script={nse_scripts}"]
+    elif not params.get("aggressive"):
+        # target-scoped script set only — see docstring (BUG-2)
+        argv += ["--script=default,safe"]
+    # broadcast NSE scripts are never target-scoped; keep them out even when
+    # the caller passes a custom --script list
+    argv += ["--script-exclude=broadcast"]
+    # one stuck NSE script must not eat the whole command budget
+    argv += ["--host-timeout=2m", "--script-timeout=30s"]
+    argv += _shell_split(additional_args)
+    argv.append(target)
+    return argv, None
+
+
 @app.route("/api/tools/nmap-advanced", methods=["POST"])
 def nmap_advanced():
     """Execute advanced Nmap scans with custom NSE scripts and optimized timing"""
     try:
-        params = request.json
+        params = request.json or {}
         target = params.get("target", "")
-        scan_type = params.get("scan_type", "-sS")
-        ports = params.get("ports", "")
-        timing = params.get("timing", "T4")
-        nse_scripts = params.get("nse_scripts", "")
-        os_detection = params.get("os_detection", False)
-        version_detection = params.get("version_detection", False)
-        aggressive = params.get("aggressive", False)
-        stealth = params.get("stealth", False)
-        additional_args = params.get("additional_args", "")
 
         if not target:
             logger.warning("🎯 Advanced Nmap called without target parameter")
             return jsonify({"error": "Target parameter is required"}), 400
 
-        command = f"nmap {scan_type} {target}"
+        try:
+            target = validate_target(target)
+        except ValueError as exc:
+            return jsonify({"error": f"invalid target: {exc}"}), 400
 
-        if ports:
-            command += f" -p {ports}"
-
-        if stealth:
-            command += " -T2 -f --mtu 24"
-        else:
-            command += f" -{timing}"
-
-        if os_detection:
-            command += " -O"
-
-        if version_detection:
-            command += " -sV"
-
-        if aggressive:
-            command += " -A"
-
-        if nse_scripts:
-            command += f" --script={nse_scripts}"
-        elif not aggressive:  # Default useful scripts if not aggressive
-            command += " --script=default,discovery,safe"
-
-        if additional_args:
-            command += f" {additional_args}"
+        params["target"] = target
+        argv, err = build_nmap_advanced_command(params)
+        if err:
+            return jsonify({"error": err}), 400
 
         logger.info(f"🔍 Starting Advanced Nmap: {target}")
-        result = execute_command(command)
+        result = execute_tool_command("nmap-advanced", argv, target, params)
         logger.info(f"📊 Advanced Nmap completed for {target}")
         return jsonify(result)
     except Exception as e:
@@ -13667,18 +13901,119 @@ def dalfox():
         logger.error(f"💥 Error in dalfox endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
+# ---------------------------------------------------------------------------
+# httpx binary resolution (BUG-1). Two unrelated CLIs are called "httpx":
+#   * projectdiscovery/httpx (Go) — reads hosts from stdin, flags
+#     -status-code / -title / -tech-detect / -content-length …
+#   * the Python `httpx` console script (encode/httpx) — takes one URL
+#     positionally, click-style usage "httpx [OPTIONS] URL", no -l flag.
+# `shutil.which("httpx")` happily returns the Python one, so a mere existence
+# check (what the health panel does) is not enough — we functionally sniff
+# the help output before using the binary.
+# ---------------------------------------------------------------------------
+
+_HTTPX_BIN_CACHE = {"checked": False, "binary": None, "variant": None}
+
+
+def _sniff_httpx_variant(binary: str) -> Optional[str]:
+    """Return "pd" | "python" | None by smoke-testing help output.
+
+    Both help flags are tried because the two CLIs disagree: click-style
+    Python httpx answers ``--help`` (usage ``httpx <URL> [OPTIONS]``, or
+    ``[OPTIONS] URL`` in older builds), while ``-h`` may mean something else
+    entirely there; projectdiscovery/httpx prints its flag list either way.
+    """
+    text = ""
+    for flag in ("--help", "-h"):
+        try:
+            proc = subprocess.run(
+                [binary, flag], capture_output=True, text=True, timeout=15
+            )
+        except Exception:
+            continue
+        text += (proc.stdout or "") + (proc.stderr or "")
+    if not text:
+        return None
+    if "-status-code" in text or "-tech-detect" in text:
+        return "pd"
+    if "<URL>" in text or "[OPTIONS] URL" in text:
+        return "python"
+    return None
+
+
+def resolve_httpx_binary():
+    """Return (binary_path, variant) with variant in {"pd", "python", None}.
+
+    Resolution order: HEXSTRIKE_HTTPX_BIN env override, then $PATH, then the
+    usual go install locations. The first projectdiscovery variant wins; a
+    Python variant is only used as a last-resort fallback. Result is cached
+    per worker — the `-h` probe runs at most once.
+    """
+    if _HTTPX_BIN_CACHE["checked"]:
+        return _HTTPX_BIN_CACHE["binary"], _HTTPX_BIN_CACHE["variant"]
+    _HTTPX_BIN_CACHE["checked"] = True
+
+    candidates = []
+    env_bin = os.environ.get("HEXSTRIKE_HTTPX_BIN")
+    if env_bin:
+        candidates.append(env_bin)
+    which = shutil.which("httpx")
+    if which:
+        candidates.append(which)
+    candidates += [
+        os.path.expanduser("~/go/bin/httpx"),
+        "/usr/local/bin/httpx",
+        "/usr/bin/httpx",
+    ]
+
+    first_python = None
+    for cand in candidates:
+        if not cand or not os.path.isfile(cand) or not os.access(cand, os.X_OK):
+            continue
+        variant = _sniff_httpx_variant(cand)
+        if variant == "pd":
+            _HTTPX_BIN_CACHE.update(binary=cand, variant="pd")
+            return cand, "pd"
+        if variant == "python" and first_python is None:
+            first_python = cand
+    if first_python:
+        logger.warning(
+            "🌐 httpx: found the Python encode/httpx CLI (%s), not the "
+            "projectdiscovery one — http_probe will run in limited fallback "
+            "mode. Install it with: go install github.com/projectdiscovery/"
+            "httpx/cmd/httpx@latest  (or set HEXSTRIKE_HTTPX_BIN)",
+            first_python,
+        )
+        _HTTPX_BIN_CACHE.update(binary=first_python, variant="python")
+    return _HTTPX_BIN_CACHE["binary"], _HTTPX_BIN_CACHE["variant"]
+
+
+def _httpx_pd_flags(params: Dict[str, Any]) -> list:
+    """Map endpoint params to projectdiscovery/httpx flags (pure function)."""
+    flags = []
+    mode = params.get("mode", "")
+    tech_detect = params.get("tech_detect")
+    if tech_detect or (tech_detect is None and mode == "tech-detect"):
+        flags.append("-tech-detect")
+    if params.get("status_code") or mode == "probe":
+        flags.append("-status-code")
+    if params.get("content_length"):
+        flags.append("-content-length")
+    if params.get("title"):
+        flags.append("-title")
+    if params.get("web_server"):
+        flags.append("-web-server")
+    return flags
+
+
 @app.route("/api/tools/httpx", methods=["POST"])
 def httpx():
     """Execute httpx for fast HTTP probing and technology detection"""
     try:
-        params = request.json
+        params = request.json or {}
         target = params.get("target", "")
-        probe = params.get("probe", True)
-        tech_detect = params.get("tech_detect", False)
-        status_code = params.get("status_code", False)
-        content_length = params.get("content_length", False)
-        title = params.get("title", False)
-        web_server = params.get("web_server", False)
+        # The http_probe MCP verb sends mode="probe"|"tech-detect"
+        mode = params.get("mode", "")
         threads = params.get("threads", 50)
         additional_args = params.get("additional_args", "")
 
@@ -13686,33 +14021,50 @@ def httpx():
             logger.warning("🌐 httpx called without target parameter")
             return jsonify({"error": "Target parameter is required"}), 400
 
-        command = f"httpx -l {target} -t {threads}"
+        try:
+            target = validate_url(target) if "://" in target else validate_target(target)
+        except ValueError as exc:
+            return jsonify({"error": f"invalid target: {exc}"}), 400
 
-        if probe:
-            command += " -probe"
+        try:
+            threads = max(1, min(int(threads), 200))
+        except (TypeError, ValueError):
+            threads = 50
 
-        if tech_detect:
-            command += " -tech-detect"
+        binary, variant = resolve_httpx_binary()
 
-        if status_code:
-            command += " -sc"
+        if variant == "pd":
+            # projectdiscovery/httpx: hosts on stdin, PD flag dialect
+            argv = [binary, "-t", str(threads)] + _httpx_pd_flags(params)
+            argv += _shell_split(additional_args)
+            logger.info(f"🌍 Starting httpx probe (pd): {target}")
+            result = execute_tool_command("httpx", argv, target, params,
+                                          stdin_data=target + "\n")
+            return jsonify(result)
 
-        if content_length:
-            command += " -cl"
+        if variant == "python":
+            # encode/httpx CLI fallback: URL positional, plain GET probe.
+            # Tech-detection and per-flag output control are unsupported.
+            if mode == "tech-detect":
+                return jsonify({
+                    "error": "tech-detect requires projectdiscovery/httpx",
+                    "hint": "go install github.com/projectdiscovery/httpx/cmd/httpx@latest",
+                    "found": binary,
+                    "variant": "python",
+                }), 501
+            url = target if "://" in target else f"http://{target}"
+            argv = [binary, url]
+            logger.info(f"🌍 Starting httpx probe (python fallback): {target}")
+            result = execute_tool_command("httpx", argv, target, params)
+            if isinstance(result, dict):
+                result["fallback"] = "python-httpx"
+            return jsonify(result)
 
-        if title:
-            command += " -title"
-
-        if web_server:
-            command += " -server"
-
-        if additional_args:
-            command += f" {additional_args}"
-
-        logger.info(f"🌍 Starting httpx probe: {target}")
-        result = execute_command(command)
-        logger.info(f"📊 httpx probe completed for {target}")
-        return jsonify(result)
+        return jsonify({
+            "error": "httpx binary not found or not functional",
+            "hint": "go install github.com/projectdiscovery/httpx/cmd/httpx@latest "
+                    "(or set HEXSTRIKE_HTTPX_BIN)",
+        }), 503
     except Exception as e:
         logger.error(f"💥 Error in httpx endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500

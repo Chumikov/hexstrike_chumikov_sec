@@ -307,8 +307,16 @@ CLI-флаги `--transport`, `--host`, `--port` переопределяют en
 |---|---|---|
 | `MCP_OPTIMIZER_ENABLED` | `true` | Вкл/выкл оптимизатор |
 | `MCP_OPTIMIZER_MAX_CHARS` | `20000` | Порог трюнкации длинного вывода (head+tail) |
-| `MCP_OPTIMIZER_DEDUP` | `true` | Дедупликация одинаковых строк |
+| `MCP_OPTIMIZER_DEDUP` | `false` | Дедупликация подряд идущих строк. **Выключена по умолчанию**: схлопывание повторов тихо искажает позиционно-значимые данные (ASCII-битмапы, hex-дампы). Включайте только для заведомо текстового вывода |
 | `MCP_OPTIMIZER_STRIP_ANSI` | `true` | Удаление ANSI-кодов и прогресс-баров |
+
+### Переменные окружения сервера
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `HEXSTRIKE_MAX_OUTPUT_BYTES` | `10485760` | Потолок захвата stdout+stderr подпроцесса; при превышении процесс убивается, результат помечается `output_truncated` (защита от flooding-бинарников) |
+| `HEXSTRIKE_HTTPX_BIN` | — | Явный путь к binary httpx. По умолчанию сервер функционально различает projectdiscovery/httpx и Python-клиент `httpx` (Kali-пакет `python3-httpx`): первый получает цели через stdin и полный набор флагов, второй используется как ограниченный fallback (URL позиционно), а tech-detect честно отвечает 501 с подсказкой установить PD-вариант |
+| `HEXSTRIKE_API_KEY` / `HEXSTRIKE_REQUIRE_AUTH` | — / `false` | API-аутентификация (`X-API-Key` / `Authorization: Bearer`) |
 
 ## Тесты и разработка
 
