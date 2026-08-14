@@ -158,8 +158,22 @@ class KillSwitch:
 
     # ------------------------------------------------------------------
     def is_engaged(self) -> bool:
-        """Whether new tool dispatches should be blocked globally."""
-        return self._engaged
+        """Whether new tool dispatches should be blocked globally.
+
+        The SQLite row is authoritative so the flag propagates across
+        gunicorn workers immediately: ``engage()``/``reset()`` in one worker
+        is visible to every other worker on the next check (the in-memory
+        copy is only a fallback for when the DB is unreachable).
+        """
+        try:
+            with get_connection() as conn:
+                row = conn.execute(
+                    "SELECT value FROM metadata WHERE key = ?", (_GLOBAL_FLAG_KEY,)
+                ).fetchone()
+            return bool(row and str(row["value"]).lower() in {"1", "true", "yes"})
+        except Exception:
+            with self._lock:
+                return self._engaged
 
     def engaged_session_ids(self) -> List[str]:
         """Sessions that currently have at least one registered process."""
@@ -357,7 +371,7 @@ class KillSwitch:
         """Summary for the health panel."""
         with self._lock:
             return {
-                "engaged": self._engaged,
+                "engaged": self.is_engaged(),
                 "sessions_with_procs": len(self._procs),
                 "registered_procs": sum(len(s) for s in self._procs.values()),
             }

@@ -293,6 +293,19 @@ class TestApiCommandGuardrails:
         assert resp.get_json()["reason"] == "kill"
         state.kill_switch.reset()
 
+    def test_kill_flag_visible_across_workers(self, guardrails_db):
+        # Two KillSwitch instances share the DB but not memory — exactly the
+        # two-gunicorn-workers situation. is_engaged() must consult the DB,
+        # not a stale in-process copy (found live during the v6.4.8 install:
+        # kill-all in worker A did not block /api/command served by worker B).
+        from hexstrike_guardrails import KillSwitch
+        ks_a, ks_b = KillSwitch(), KillSwitch()
+        assert ks_b.is_engaged() is False
+        ks_a.engage(session_id=None, reason="cross-worker test")
+        assert ks_b.is_engaged() is True
+        ks_a.reset()
+        assert ks_b.is_engaged() is False
+
     def test_tool_and_target_inference(self):
         assert server._infer_bare_tool("nmap -sV 10.0.0.1") == "nmap"
         assert server._infer_bare_tool(["/usr/bin/curl", "-s", "x"]) == "curl"
