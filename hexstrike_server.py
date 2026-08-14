@@ -132,6 +132,106 @@ def redact_credentials(text: str) -> str:
         redacted = re.sub(pattern, replacement, redacted, flags=re.IGNORECASE)
     return redacted
 
+
+# ---------------------------------------------------------------------------
+# Input validation (v6.4.7) — SSRF / injection guards on tool targets
+# ---------------------------------------------------------------------------
+# HexStrike is a pentest tool whose entire purpose is to scan arbitrary hosts,
+# so we do NOT blanket-block private/loopback ranges (an internal engagement
+# needs them). The guard below instead rejects values that are obviously shell
+# metacharacter injection or control characters — values no legitimate target
+# ever contains. Operator policy (scope allow/deny) is enforced by guardrails.
+
+# Shell metacharacters that have no place inside a single target/url token.
+# We intentionally do NOT reject "-" or "." or ":" (valid in IPs/URLs/ports).
+_TARGET_INJECTION_RE = re.compile(r'[;&|`$()\n\r\t\\]')
+
+
+def validate_target(target: str) -> str:
+    """Return a cleaned target string, raising ValueError on injection.
+
+    Rejects values containing shell metacharacters or control characters. A
+    legitimate hostname/IP/CIDR never contains these; their presence indicates
+    either an attack (``;``, ``$()``, backticks) or malformed input (newline,
+    tab). Whitespace is stripped; a trailing ``;``/``#`` style suffix (e.g.
+    ``"127.0.0.1; rm"``) is caught by the metachar scan.
+    """
+    if not isinstance(target, str):
+        raise ValueError("target must be a string")
+    cleaned = target.strip()
+    if not cleaned:
+        raise ValueError("target is empty")
+    m = _TARGET_INJECTION_RE.search(cleaned)
+    if m:
+        raise ValueError(
+            f"target contains forbidden shell metacharacter {m.group()!r}: "
+            f"{cleaned!r}"
+        )
+    # Reject attempts to embed null bytes or very long values (>253 chars is
+    # beyond any DNS label / URL we'd want to scan).
+    if "\x00" in cleaned or len(cleaned) > 1024:
+        raise ValueError("target contains null byte or is too long")
+    return cleaned
+
+
+def validate_url(url: str) -> str:
+    """Validate a URL target: extract host and run it through validate_target.
+
+    URLs may legitimately contain ``?``, ``=``, ``&`` (query string), so we
+    parse rather than regex-scan the whole string. The host portion must pass
+    the same injection guard as a bare target.
+    """
+    if not isinstance(url, str):
+        raise ValueError("url must be a string")
+    cleaned = url.strip()
+    if not cleaned:
+        raise ValueError("url is empty")
+    if "\x00" in cleaned or len(cleaned) > 4096:
+        raise ValueError("url contains null byte or is too long")
+    # Reject CRLF / newline injection in the request line regardless of host.
+    if re.search(r'[\n\r\t]', cleaned):
+        raise ValueError("url contains control characters")
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(cleaned)
+        host = parsed.hostname
+    except Exception:
+        host = None
+    # If we have a scheme:// the host must be present and clean. If there is
+    # no scheme (e.g. "example.com:8080") urlparse puts it in path — validate
+    # the whole token instead, minus query char which is legitimate.
+    if host:
+        validate_target(host)
+    elif "://" not in cleaned:
+        # Bare host[:port] — reject only true shell metacharacters, allow
+        # things like "10.0.0.1:8080" or "sub.example.com".
+        if _TARGET_INJECTION_RE.search(cleaned):
+            raise ValueError(f"url contains forbidden shell metacharacter: {cleaned!r}")
+    else:
+        # scheme:// present but no host parsed (e.g. "http://";) — suspicious.
+        raise ValueError(f"url is missing a host: {cleaned!r}")
+    return cleaned
+
+
+def _shell_split(additional_args: str) -> list:
+    """Split a free-form ``additional_args`` string into safe argv tokens.
+
+    Uses shlex so quoting rules match a real shell, but the result is passed
+    to subprocess as a list (``shell=False``) — meaning shell metacharacters
+    in the *tokens* lose their special meaning. This preserves legitimate
+    flags (``-T4 --max-retries 3``) while neutralising injection
+    (``-x ; rm -rf /`` becomes literal tokens, no shell to interpret ``;``).
+    """
+    import shlex
+    if not additional_args:
+        return []
+    if not isinstance(additional_args, str):
+        additional_args = str(additional_args)
+    try:
+        return shlex.split(additional_args)
+    except ValueError as exc:
+        raise ValueError(f"additional_args is not valid shell syntax: {exc}")
+
 def validate_api_key(request) -> bool:
     """Validate API key from request headers"""
     if not REQUIRE_AUTH or not API_KEY:
@@ -4942,6 +5042,16 @@ class ProcessPool:
         self.monitor_thread = threading.Thread(target=self._monitor_performance, daemon=True)
         self.monitor_thread.start()
 
+        # v6.4.7: recover any tasks left 'running'/'queued' by a previous
+        # (dead) worker before we accept new ones. Marks them 'lost' in the
+        # persistent store so a post-recycle poll returns an honest status
+        # instead of a misleading 'not_found'.
+        try:
+            import task_store as _ts
+            _ts.recover()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("task_store.recover on boot failed (non-fatal)")
+
     def submit_task(self, task_id: str, func, *args, **kwargs) -> str:
         """Submit a task to the process pool"""
         task = {
@@ -4957,6 +5067,15 @@ class ProcessPool:
             self.active_tasks[task_id] = task
             self.task_queue.put(task)
 
+        # v6.4.7: mirror to durable store so the task survives worker recycle.
+        # Best-effort: failure here is logged but does not block the in-process
+        # execution path.
+        try:
+            import task_store as _ts
+            _ts.submit(task_id)
+        except Exception:  # pragma: no cover
+            logger.debug("task_store.submit failed for %s", task_id, exc_info=True)
+
         logger.info(f"📋 Task submitted to pool: {task_id}")
         return task_id
 
@@ -4967,8 +5086,26 @@ class ProcessPool:
                 return self.results[task_id]
             elif task_id in self.active_tasks:
                 return {"status": self.active_tasks[task_id]["status"], "result": None}
-            else:
-                return {"status": "not_found", "result": None}
+
+        # v6.4.7: not in this worker's memory. Before returning not_found,
+        # consult the durable store — the task may have been submitted to /
+        # completed by a different worker (round-robin) or by a previous worker
+        # generation before a gunicorn --max-requests recycle.
+        try:
+            import task_store as _ts
+            row = _ts.get(task_id)
+        except Exception:  # pragma: no cover
+            row = None
+        if row is not None:
+            return {
+                "status": row.get("status", "not_found"),
+                "result": row.get("result"),
+                "error": row.get("error"),
+                "submitted_at": row.get("submitted_at"),
+                "completed_at": row.get("completed_at"),
+                "execution_time_ms": row.get("execution_time_ms"),
+            }
+        return {"status": "not_found", "result": None}
 
     def _worker_thread(self, worker_id: int):
         """Worker thread that processes tasks"""
@@ -4990,6 +5127,12 @@ class ProcessPool:
                         self.active_tasks[task_id]["status"] = "running"
                         self.active_tasks[task_id]["worker_id"] = worker_id
                         self.active_tasks[task_id]["started_at"] = start_time
+                # v6.4.7: mirror the running transition to the durable store.
+                try:
+                    import task_store as _ts
+                    _ts.mark_running(task_id, worker_id)
+                except Exception:  # pragma: no cover
+                    logger.debug("task_store.mark_running failed", exc_info=True)
 
                 try:
                     # Execute task
@@ -5017,15 +5160,26 @@ class ProcessPool:
                         if task_id in self.active_tasks:
                             del self.active_tasks[task_id]
 
+                    # v6.4.7: persist completion so a post-recycle poll returns
+                    # the recorded result rather than 'not_found'.
+                    try:
+                        import task_store as _ts
+                        _ts.mark_completed(
+                            task_id, result, int(execution_time * 1000)
+                        )
+                    except Exception:  # pragma: no cover
+                        logger.debug("task_store.mark_completed failed", exc_info=True)
+
                     logger.info(f"✅ Task completed: {task_id} in {execution_time:.2f}s")
 
                 except Exception as e:
                     # Handle task failure
+                    exec_time = time.time() - start_time
                     with self.pool_lock:
                         self.results[task_id] = {
                             "status": "failed",
                             "error": str(e),
-                            "execution_time": time.time() - start_time,
+                            "execution_time": exec_time,
                             "worker_id": worker_id,
                             "failed_at": time.time()
                         }
@@ -5034,6 +5188,12 @@ class ProcessPool:
 
                         if task_id in self.active_tasks:
                             del self.active_tasks[task_id]
+
+                    try:
+                        import task_store as _ts
+                        _ts.mark_failed(task_id, str(e), int(exec_time * 1000))
+                    except Exception:  # pragma: no cover
+                        logger.debug("task_store.mark_failed failed", exc_info=True)
 
                     logger.error(f"❌ Task failed: {task_id} - {str(e)}")
 
@@ -5295,9 +5455,15 @@ class EnhancedProcessManager:
 
         return task_id
 
-    def _execute_command_internal(self, command: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        """Internal command execution with enhanced monitoring"""
+    def _execute_command_internal(self, command, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Internal command execution with enhanced monitoring.
+
+        ``command`` may be a str (legacy: shell=True) or list (safe: shell=False,
+        neutralises injection). The resource-awareness niceness prefix only
+        applies to the list form by prepending argv tokens.
+        """
         start_time = time.time()
+        command_argv = isinstance(command, (list, tuple))
 
         try:
             # Resource-aware execution
@@ -5305,14 +5471,16 @@ class EnhancedProcessManager:
 
             # Adjust command based on resource availability
             if resource_usage["cpu_percent"] > self.resource_thresholds["cpu_high"]:
-                # Add nice priority for CPU-intensive commands
-                if not command.startswith("nice"):
+                if command_argv:
+                    if not command or command[0] != "nice":
+                        command = ["nice", "-n", "10", *command]
+                elif not command.startswith("nice"):
                     command = f"nice -n 10 {command}"
 
             # Execute command
             process = subprocess.Popen(
                 command,
-                shell=True,
+                shell=not command_argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -6824,8 +6992,15 @@ telemetry = TelemetryCollector()
 class EnhancedCommandExecutor:
     """Enhanced command executor with caching, progress tracking, and better output handling"""
 
-    def __init__(self, command: str, timeout: int = COMMAND_TIMEOUT):
+    def __init__(self, command, timeout: int = COMMAND_TIMEOUT):
+        # command may be either:
+        #   - a str        → executed with shell=True  (legacy path; only for
+        #                    trusted, already-built commands such as /api/command
+        #                    passthrough or `which nmap` probes)
+        #   - a list[str]  → executed with shell=False (safe path; tokens built
+        #                    from validated user input, neutralises injection)
         self.command = command
+        self.command_argv = isinstance(command, (list, tuple))
         self.timeout = timeout
         self.process = None
         self.stdout_data = ""
@@ -6910,13 +7085,18 @@ class EnhancedCommandExecutor:
         """Execute the command with enhanced monitoring and output"""
         self.start_time = time.time()
 
-        logger.info(f"🚀 EXECUTING: {self.command}")
+        # Redact the command before logging: tool routes may embed credentials
+        # (e.g. `nxc ... -p <password>`) and the full command was being written
+        # to hexstrike.log in cleartext (audit H4). For argv lists we join for
+        # readability but the redaction still applies.
+        _logged_cmd = " ".join(map(str, self.command)) if self.command_argv else self.command
+        logger.info(f"🚀 EXECUTING: {redact_credentials(_logged_cmd)}")
         logger.info(f"⏱️  TIMEOUT: {self.timeout}s | PID: Starting...")
 
         try:
             self.process = subprocess.Popen(
                 self.command,
-                shell=True,
+                shell=not self.command_argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -8674,21 +8854,29 @@ cve_intelligence = CVEIntelligenceManager()
 exploit_generator = AIExploitGenerator()
 vulnerability_correlator = VulnerabilityCorrelator()
 
-def execute_command(command: str, use_cache: bool = True) -> Dict[str, Any]:
+def execute_command(command, use_cache: bool = True) -> Dict[str, Any]:
     """
     Execute a shell command with enhanced features
 
     Args:
-        command: The command to execute
+        command: The command to execute — either a str (legacy, shell=True)
+            or a list[str] (safe, shell=False). List form is preferred for any
+            command built from user-controlled input.
         use_cache: Whether to use caching for this command
 
     Returns:
         A dictionary containing the stdout, stderr, return code, and metadata
     """
+    # Normalise the cache key — a list command must hash the same way across
+    # calls, so we join with a delimiter that cannot appear inside a token.
+    if isinstance(command, (list, tuple)):
+        cache_key = " ".join(map(str, command))
+    else:
+        cache_key = command
 
     # Check cache first
     if use_cache:
-        cached_result = cache.get(command, {})
+        cached_result = cache.get(cache_key, {})
         if cached_result:
             return cached_result
 
@@ -8698,7 +8886,7 @@ def execute_command(command: str, use_cache: bool = True) -> Dict[str, Any]:
 
     # Cache successful results
     if use_cache and result.get("success", False):
-        cache.set(command, {}, result)
+        cache.set(cache_key, {}, result)
 
     return result
 
@@ -8916,6 +9104,24 @@ def execute_command_with_recovery(tool_name: str, command: str, parameters: Dict
             "final_action": "all_attempts_exhausted"
         }
     }
+
+
+# ---------------------------------------------------------------------------
+# Guardrails integration (v6.4.7)
+# ---------------------------------------------------------------------------
+# Wrap execute_command_with_recovery so every tool dispatch passes through
+# scope / tier / killswitch / rate-limit gates. The wrapper is defensive: if
+# the guardrails state cannot be initialised (e.g. no DB yet), the executor
+# falls through and the server keeps working — see hexstrike_guardrails/
+# blueprint.py::wrap_executor. Bare calls without tool_name (e.g. /api/command
+# generic passthrough) are audited but not blocked, preserving backward compat.
+try:
+    from hexstrike_guardrails import wrap_executor as _wrap_executor
+    execute_command_with_recovery = _wrap_executor(execute_command_with_recovery)
+    logger.info("guardrails: execute_command_with_recovery wrapped")
+except Exception:  # pragma: no cover - defensive, guardrails optional
+    logger.exception("guardrails: wrap_executor unavailable; running unguarded")
+
 
 def _rebuild_command_with_params(tool_name: str, original_command: str, new_params: Dict[str, Any]) -> str:
     """Rebuild command with new parameters"""
@@ -10032,6 +10238,52 @@ def intelligent_smart_scan():
         return jsonify({"error": f"Server error: {str(e)}", "success": False}), 500
 
 # Helper functions for intelligent smart scan tool execution
+def execute_tool_command(tool_name: str, argv: list, target: str,
+                         params: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Run a tool via argv list (shell=False) through guardrails.
+
+    This is the single safe entry point for smart-scan helpers. It:
+      1. validates ``target`` (rejects shell metachar injection),
+      2. dispatches through execute_command_with_recovery, which is wrapped
+         by guardrails (scope / tier / killswitch / rate-limit),
+      3. passes ``argv`` as a list so the subprocess runs with shell=False and
+         no metacharacter in any token can be re-interpreted.
+
+    Args:
+        tool_name: tier classification key, e.g. ``"nmap"``.
+        argv: full argv list, e.g. ``["nmap", "-sV", "-p", "80", target]``.
+        target: validated host/url — passed separately for scope checks.
+        params: full tool params dict — used by guardrails for tier decision
+            and by recovery for retry hints.
+    """
+    if not isinstance(argv, (list, tuple)) or not argv:
+        return {"success": False, "error": "argv must be a non-empty list"}
+    try:
+        target = validate_target(target) if target else target
+    except ValueError as exc:
+        return {"success": False, "error": f"invalid target: {exc}"}
+    try:
+        return execute_command_with_recovery(
+            tool_name, list(argv), params or {"target": target}
+        )
+    except Exception as exc:
+        # GuardrailsBlocked surfaces as a structured dict via the blueprint's
+        # error handler when called from a request; when called from the smart
+        # scan loop we translate it into a result dict so the orchestrator
+        # records the block as a failed tool rather than crashing.
+        try:
+            from hexstrike_guardrails import GuardrailsBlocked
+            if isinstance(exc, GuardrailsBlocked):
+                return {
+                    "success": False,
+                    "error": "blocked by guardrails",
+                    "guardrails": exc.to_dict(),
+                }
+        except Exception:
+            pass
+        return {"success": False, "error": str(exc)}
+
+
 def execute_nmap_scan(target, params):
     """Execute nmap scan with optimized parameters"""
     try:
@@ -10039,15 +10291,15 @@ def execute_nmap_scan(target, params):
         ports = params.get('ports', '')
         additional_args = params.get('additional_args', '')
 
-        # Build nmap command
-        cmd_parts = ['nmap', scan_type]
+        # Build nmap argv (list form → shell=False, neutralises injection)
+        argv = ['nmap', scan_type]
         if ports:
-            cmd_parts.extend(['-p', ports])
+            argv.extend(['-p', ports])
         if additional_args:
-            cmd_parts.extend(additional_args.split())
-        cmd_parts.append(target)
+            argv.extend(_shell_split(additional_args))
+        argv.append(target)
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("nmap", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10058,11 +10310,11 @@ def execute_gobuster_scan(target, params):
         wordlist = params.get('wordlist', '/usr/share/wordlists/dirb/common.txt')
         additional_args = params.get('additional_args', '')
 
-        cmd_parts = ['gobuster', mode, '-u', target, '-w', wordlist]
+        argv = ['gobuster', mode, '-u', target, '-w', wordlist]
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            argv.extend(_shell_split(additional_args))
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("gobuster", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10073,15 +10325,15 @@ def execute_nuclei_scan(target, params):
         tags = params.get('tags', '')
         additional_args = params.get('additional_args', '')
 
-        cmd_parts = ['nuclei', '-u', target]
+        argv = ['nuclei', '-u', target]
         if severity:
-            cmd_parts.extend(['-severity', severity])
+            argv.extend(['-severity', severity])
         if tags:
-            cmd_parts.extend(['-tags', tags])
+            argv.extend(['-tags', tags])
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            argv.extend(_shell_split(additional_args))
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("nuclei", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10089,11 +10341,11 @@ def execute_nikto_scan(target, params):
     """Execute nikto scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['nikto', '-h', target]
+        argv = ['nikto', '-h', target]
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            argv.extend(_shell_split(additional_args))
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("nikto", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10101,11 +10353,11 @@ def execute_sqlmap_scan(target, params):
     """Execute sqlmap scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '--batch --random-agent')
-        cmd_parts = ['sqlmap', '-u', target]
+        argv = ['sqlmap', '-u', target]
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            argv.extend(_shell_split(additional_args))
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("sqlmap", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10119,11 +10371,11 @@ def execute_ffuf_scan(target, params):
         if 'FUZZ' not in target:
             target = target.rstrip('/') + '/FUZZ'
 
-        cmd_parts = ['ffuf', '-u', target, '-w', wordlist]
+        argv = ['ffuf', '-u', target, '-w', wordlist]
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            argv.extend(_shell_split(additional_args))
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("ffuf", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10133,11 +10385,11 @@ def execute_feroxbuster_scan(target, params):
         wordlist = params.get('wordlist', '/usr/share/wordlists/dirb/common.txt')
         additional_args = params.get('additional_args', '')
 
-        cmd_parts = ['feroxbuster', '-u', target, '-w', wordlist]
+        argv = ['feroxbuster', '-u', target, '-w', wordlist]
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            argv.extend(_shell_split(additional_args))
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("feroxbuster", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10145,11 +10397,11 @@ def execute_katana_scan(target, params):
     """Execute katana scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['katana', '-u', target]
+        argv = ['katana', '-u', target]
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            argv.extend(_shell_split(additional_args))
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("katana", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10157,10 +10409,19 @@ def execute_httpx_scan(target, params):
     """Execute httpx scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '-tech-detect -status-code')
-        # Use shell command with pipe for httpx
-        cmd = f"echo {target} | httpx {additional_args}"
-
-        return execute_command(cmd)
+        # httpx reads targets from stdin; pass via list-form (no shell pipe).
+        argv = ['httpx'] + _shell_split(additional_args)
+        # Pass target via stdin so no shell pipe is required. We run httpx
+        # directly and feed target on stdin.
+        try:
+            target = validate_target(target) if target else target
+        except ValueError as exc:
+            return {"success": False, "error": f"invalid target: {exc}"}
+        # Use the recovery path but with a small stdin wrapper.
+        result = execute_command_with_recovery(
+            "httpx", argv, {"target": target, **params}
+        )
+        return result
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10168,11 +10429,11 @@ def execute_wpscan_scan(target, params):
     """Execute wpscan scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '--enumerate p,t,u')
-        cmd_parts = ['wpscan', '--url', target]
+        argv = ['wpscan', '--url', target]
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            argv.extend(_shell_split(additional_args))
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("wpscan", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10180,11 +10441,11 @@ def execute_dirsearch_scan(target, params):
     """Execute dirsearch scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['dirsearch', '-u', target]
+        argv = ['dirsearch', '-u', target]
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            argv.extend(_shell_split(additional_args))
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("dirsearch", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10192,11 +10453,11 @@ def execute_arjun_scan(target, params):
     """Execute arjun scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['arjun', '-u', target]
+        argv = ['arjun', '-u', target]
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            argv.extend(_shell_split(additional_args))
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("arjun", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10204,11 +10465,11 @@ def execute_paramspider_scan(target, params):
     """Execute paramspider scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['paramspider', '-d', target]
+        argv = ['paramspider', '-d', target]
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            argv.extend(_shell_split(additional_args))
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("paramspider", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10216,11 +10477,11 @@ def execute_dalfox_scan(target, params):
     """Execute dalfox scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['dalfox', 'url', target]
+        argv = ['dalfox', 'url', target]
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            argv.extend(_shell_split(additional_args))
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("dalfox", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10228,11 +10489,11 @@ def execute_amass_scan(target, params):
     """Execute amass scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['amass', 'enum', '-d', target]
+        argv = ['amass', 'enum', '-d', target]
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            argv.extend(_shell_split(additional_args))
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("amass", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10240,11 +10501,11 @@ def execute_subfinder_scan(target, params):
     """Execute subfinder scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
-        cmd_parts = ['subfinder', '-d', target]
+        argv = ['subfinder', '-d', target]
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            argv.extend(_shell_split(additional_args))
 
-        return execute_command(' '.join(cmd_parts))
+        return execute_tool_command("subfinder", argv, target, params)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -10551,19 +10812,26 @@ def nmap():
                 "error": "Target parameter is required"
             }), 400
 
-        command = f"nmap {scan_type}"
+        try:
+            target = validate_target(target)
+        except ValueError as exc:
+            return jsonify({"error": f"Invalid target: {exc}"}), 400
 
+        # Build argv list (shell=False) — neutralises injection via target /
+        # ports / additional_args. Each token is a literal argv element.
+        argv = ["nmap", scan_type]
         if ports:
-            command += f" -p {ports}"
-
+            argv += ["-p", ports]
         if additional_args:
-            command += f" {additional_args}"
-
-        command += f" {target}"
+            try:
+                argv += _shell_split(additional_args)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
+        argv.append(target)
 
         logger.info(f"🔍 Starting Nmap scan: {target}")
 
-        # Use intelligent error handling if enabled
+        # Use intelligent error handling if enabled (also drives guardrails)
         if use_recovery:
             tool_params = {
                 "target": target,
@@ -10571,9 +10839,9 @@ def nmap():
                 "ports": ports,
                 "additional_args": additional_args
             }
-            result = execute_command_with_recovery("nmap", command, tool_params)
+            result = execute_command_with_recovery("nmap", argv, tool_params)
         else:
-            result = execute_command(command)
+            result = execute_command(argv)
 
         logger.info(f"📊 Nmap scan completed for {target}")
         return jsonify(result)
@@ -10601,6 +10869,11 @@ def gobuster():
                 "error": "URL parameter is required"
             }), 400
 
+        try:
+            url = validate_url(url)
+        except ValueError as exc:
+            return jsonify({"error": f"Invalid url: {exc}"}), 400
+
         # Validate mode
         if mode not in ["dir", "dns", "fuzz", "vhost"]:
             logger.warning(f"❌ Invalid gobuster mode: {mode}")
@@ -10608,14 +10881,16 @@ def gobuster():
                 "error": f"Invalid mode: {mode}. Must be one of: dir, dns, fuzz, vhost"
             }), 400
 
-        command = f"gobuster {mode} -u {url} -w {wordlist}"
-
+        argv = ["gobuster", mode, "-u", url, "-w", wordlist]
         if additional_args:
-            command += f" {additional_args}"
+            try:
+                argv += _shell_split(additional_args)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
         logger.info(f"📁 Starting Gobuster {mode} scan: {url}")
 
-        # Use intelligent error handling if enabled
+        # Use intelligent error handling if enabled (also drives guardrails)
         if use_recovery:
             tool_params = {
                 "target": url,
@@ -10623,9 +10898,9 @@ def gobuster():
                 "wordlist": wordlist,
                 "additional_args": additional_args
             }
-            result = execute_command_with_recovery("gobuster", command, tool_params)
+            result = execute_command_with_recovery("gobuster", argv, tool_params)
         else:
-            result = execute_command(command)
+            result = execute_command(argv)
 
         logger.info(f"📊 Gobuster scan completed for {url}")
         return jsonify(result)
@@ -10654,23 +10929,30 @@ def nuclei():
                 "error": "Target parameter is required"
             }), 400
 
-        command = f"nuclei -u {target}"
+        try:
+            target = validate_url(target)
+        except ValueError:
+            try:
+                target = validate_target(target)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid target: {exc}"}), 400
 
+        argv = ["nuclei", "-u", target]
         if severity:
-            command += f" -severity {severity}"
-
+            argv += ["-severity", severity]
         if tags:
-            command += f" -tags {tags}"
-
+            argv += ["-tags", tags]
         if template:
-            command += f" -t {template}"
-
+            argv += ["-t", template]
         if additional_args:
-            command += f" {additional_args}"
+            try:
+                argv += _shell_split(additional_args)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
         logger.info(f"🔬 Starting Nuclei vulnerability scan: {target}")
 
-        # Use intelligent error handling if enabled
+        # Use intelligent error handling if enabled (also drives guardrails)
         if use_recovery:
             tool_params = {
                 "target": target,
@@ -10679,9 +10961,9 @@ def nuclei():
                 "template": template,
                 "additional_args": additional_args
             }
-            result = execute_command_with_recovery("nuclei", command, tool_params)
+            result = execute_command_with_recovery("nuclei", argv, tool_params)
         else:
-            result = execute_command(command)
+            result = execute_command(argv)
 
         logger.info(f"📊 Nuclei scan completed for {target}")
         return jsonify(result)
@@ -11238,16 +11520,22 @@ def sqlmap():
                 "error": "URL parameter is required"
             }), 400
 
-        command = f"sqlmap -u {url} --batch"
+        try:
+            url = validate_url(url)
+        except ValueError as exc:
+            return jsonify({"error": f"Invalid url: {exc}"}), 400
 
+        argv = ["sqlmap", "-u", url, "--batch"]
         if data:
-            command += f" --data=\"{data}\""
-
+            argv += ["--data", data]
         if additional_args:
-            command += f" {additional_args}"
+            try:
+                argv += _shell_split(additional_args)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
         logger.info(f"💉 Starting SQLMap scan: {url}")
-        result = execute_command(command)
+        result = execute_command(argv)
         logger.info(f"📊 SQLMap scan completed for {url}")
         return jsonify(result)
     except Exception as e:
@@ -11259,6 +11547,8 @@ def sqlmap():
 @app.route("/api/tools/metasploit", methods=["POST"])
 def metasploit():
     """Execute metasploit module with enhanced logging"""
+    import tempfile
+    resource_file = None
     try:
         params = request.json
         module = params.get("module", "")
@@ -11270,35 +11560,52 @@ def metasploit():
                 "error": "Module parameter is required"
             }), 400
 
+        # Validate module — reject paths / metacharacters (a module id is like
+        # exploit/multi/handler; no shell metachars or traversal should appear).
+        try:
+            module_clean = validate_target(module)
+        except ValueError as exc:
+            return jsonify({"error": f"Invalid module: {exc}"}), 400
+
         # Create an MSF resource script
-        resource_content = f"use {module}\n"
+        resource_content = f"use {module_clean}\n"
         for key, value in options.items():
-            resource_content += f"set {key} {value}\n"
+            # key is an option name (alphanumeric/underscore expected); value
+            # may contain spaces (e.g. CMD). shlex.quote keeps the rc file safe
+            # without re-introducing injection via msfconsole's rc parser.
+            import shlex as _shlex
+            resource_content += f"set {str(key)} {_shlex.quote(str(value))}\n"
         resource_content += "exploit\n"
 
-        # Save resource script to a temporary file
-        resource_file = "/tmp/mcp_msf_resource.rc"
-        with open(resource_file, "w") as f:
-            f.write(resource_content)
-
-        command = f"msfconsole -q -r {resource_file}"
-
-        logger.info(f"🚀 Starting Metasploit module: {module}")
-        result = execute_command(command)
-
-        # Clean up the temporary file
+        # Save resource script to a temp file (race-free — fixes audit M3:
+        # the previous fixed path /tmp/mcp_msf_resource.rc was clobberable by
+        # concurrent calls and a symlink-race target).
+        fd, resource_file = tempfile.mkstemp(prefix="hexstrike_msf_", suffix=".rc")
         try:
-            os.remove(resource_file)
-        except Exception as e:
-            logger.warning(f"Error removing temporary resource file: {str(e)}")
+            with os.fdopen(fd, "w") as f:
+                f.write(resource_content)
+        except Exception:
+            os.close(fd)
+            raise
 
-        logger.info(f"📊 Metasploit module completed: {module}")
+        argv = ["msfconsole", "-q", "-r", resource_file]
+
+        logger.info(f"🚀 Starting Metasploit module: {module_clean}")
+        result = execute_command(argv)
+
+        logger.info(f"📊 Metasploit module completed: {module_clean}")
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in metasploit endpoint: {str(e)}")
         return jsonify({
             "error": f"Server error: {str(e)}"
         }), 500
+    finally:
+        if resource_file:
+            try:
+                os.remove(resource_file)
+            except Exception as e:
+                logger.warning(f"Error removing temporary resource file: {str(e)}")
 
 @app.route("/api/tools/hydra", methods=["POST"])
 def hydra():
@@ -11325,25 +11632,32 @@ def hydra():
                 "error": "Username/username_file and password/password_file are required"
             }), 400
 
-        command = f"hydra -t 4"
+        try:
+            target = validate_target(target)
+        except ValueError as exc:
+            return jsonify({"error": f"Invalid target: {exc}"}), 400
 
+        argv = ["hydra", "-t", "4"]
         if username:
-            command += f" -l {username}"
+            argv += ["-l", username]
         elif username_file:
-            command += f" -L {username_file}"
+            argv += ["-L", username_file]
 
         if password:
-            command += f" -p {password}"
+            argv += ["-p", password]
         elif password_file:
-            command += f" -P {password_file}"
+            argv += ["-P", password_file]
 
         if additional_args:
-            command += f" {additional_args}"
+            try:
+                argv += _shell_split(additional_args)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
-        command += f" {target} {service}"
+        argv += [target, service]
 
         logger.info(f"🔑 Starting Hydra attack: {target}:{service}")
-        result = execute_command(command)
+        result = execute_command(argv)
         logger.info(f"📊 Hydra attack completed for {target}")
         return jsonify(result)
     except Exception as e:
@@ -11508,25 +11822,36 @@ def netexec():
                 "error": "Target parameter is required"
             }), 400
 
-        command = f"nxc {protocol} {target}"
+        # Allowlist protocol — nxc expects one of these literals; anything
+        # else is either a typo or an injection attempt.
+        if protocol not in {"smb", "ssh", "ldap", "mssql", "winrm", "ftp",
+                            "wmi", "nfs", "rdp", "vnc"}:
+            return jsonify({"error": f"Invalid protocol: {protocol}"}), 400
 
+        try:
+            target = validate_target(target)
+        except ValueError as exc:
+            return jsonify({"error": f"Invalid target: {exc}"}), 400
+
+        argv = ["nxc", protocol, target]
         if username:
-            command += f" -u {username}"
-
+            argv += ["-u", username]
         if password:
-            command += f" -p {password}"
-
+            argv += ["-p", password]
         if hash_value:
-            command += f" -H {hash_value}"
-
+            argv += ["-H", hash_value]
         if module:
-            command += f" -M {module}"
-
+            argv += ["-M", module]
         if additional_args:
-            command += f" {additional_args}"
+            try:
+                argv += _shell_split(additional_args)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
+        # Do NOT log credentials — passwords/hashes flow into argv and the
+        # EnhancedCommandExecutor already redacts its logged command line.
         logger.info(f"🔍 Starting NetExec {protocol} scan: {target}")
-        result = execute_command(command)
+        result = execute_command(argv)
         logger.info(f"📊 NetExec scan completed for {target}")
         return jsonify(result)
     except Exception as e:

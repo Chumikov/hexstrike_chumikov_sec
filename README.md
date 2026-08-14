@@ -2,7 +2,9 @@
 
 В своей статье https://habr.com/ru/articles/985450/ я рассмотрел интеграцию Hexstrike-AI и OpenCode в Kali Linux. С того времени вышло много обновлений OpenCode и всего пара патчей безопасности для HexStrike, а работа связки оставалась крайне нестабильной и местами медленной. Ждать обещанную 7-ю версию HexStrike (которая, судя по всему, не выйдет в open-source) я не стал — и начал развивать собственный форк.
 
-Текущая версия: **v6.4.5 «Streamline»** (включает всё из не публиковавшейся ранее v6.4.0 «Guardrails»). Релиз добавляет слой guardrails (scope-валидация, классификация 144 инструментов по SAFE/INTRUSIVE/DESTRUCTIVE, per-target rate limiter, kill switch, audit log в SQLite, персистентные сессии с CVSS-скорингом и markdown-отчётами), а также консолидирует 14 близнецов-инструментов в 6 «глаголов» (`port_scan`, `subdomain_enum`, `http_probe`, `directory_brute`, `web_vuln_scan`, `cloud_audit`), добавляет `metasploit_run` под guardrails и env-профили `HEXSTRIKE_MCP_PROFILE` для экономии токенов. Всего **456 тестов** (+41 к v6.4.0).
+Текущая версия: **v6.4.7 «Hardened»** — security-релиз по итогам глубокого аудита: закрывает class command injection (все tool-роуты переведены на argv-list исполнение с `shell=False` + валидация target/url), подключает guardrails к пути исполнения (`wrap_executor`), добавляет персистентное task-хранилище в SQLite (async-задачи переживают recycle gunicorn-воркеров) и MIT-лицензию. Всего **504 теста**.
+
+Предыдущие вехи: v6.4.6 — OOM-resilience (systemd hardening, health-retry); v6.4.5 «Streamline» — консолидация 14 близнецов-инструментов в 6 «глаголов», `metasploit_run` под guardrails, env-профили `HEXSTRIKE_MCP_PROFILE`; v6.4.0 «Guardrails» — scope-валидация, классификация 144 инструментов по SAFE/INTRUSIVE/DESTRUCTIVE, per-target rate limiter, kill switch, audit log, персистентные сессии с CVSS-скорингом и markdown-отчётами.
 
 Далее предполагается, что HexStrike и OpenCode у вас уже установлены (читайте мою статью).
 
@@ -22,7 +24,8 @@
 10. [Тесты и разработка](#тесты-и-разработка)
 11. [Guardrails и сессии (v6.4.0)](#guardrails-и-сессии-v640)
 12. [MCP-консолидация и профили (v6.4.5)](#mcp-консолидация-и-профили-v645)
-13. [Синхронизация с upstream](#синхронизация-с-upstream)
+13. [Hardening: command injection + персистентные задачи (v6.4.7)](#hardening-command-injection--персистентные-задачи-v647)
+14. [Синхронизация с upstream](#синхронизация-с-upstream)
 
 ---
 
@@ -70,6 +73,7 @@ curl http://127.0.0.1:8888/health
 | `hexstrike_optimizer.py` | Оптимизатор контекста/токенов (v6.3.0) |
 | `hexstrike_guardrails/` | Слой безопасности: scope/tier/rate/kill/audit (v6.4.0, 9 модулей) |
 | `pentest_session.py` | Персистентные пентест-сессии, CVSS, отчёты (v6.4.0) |
+| `task_store.py` | Персистентное хранилище async-задач в SQLite (v6.4.7) |
 | `schemas/hexstrike_sessions.sql` | DDL: 6 таблиц SQLite для guardrails и сессий (v6.4.0) |
 | `data/` | Runtime SQLite (`hexstrike_sessions.db`, gitignored) |
 | `deploy.sh` | Полный деплой: venv, зависимости, systemd, проверка |
@@ -102,7 +106,7 @@ curl http://127.0.0.1:8888/health
 `deploy.sh` выполняет все шаги автоматически (12 шагов):
 
 1. Проверка окружения (root, наличие `hexstrike-ai`, Python >= 3.10, архитектуры)
-2. Копирование файлов проекта: `hexstrike_server.py`, `hexstrike_mcp.py`, `hexstrike_optimizer.py`, `hexstrike_guardrails/`, `pentest_session.py`, `schemas/`, `templates/`, `VERSION`, `requirements.txt`; подготовка `data/` для SQLite
+2. Копирование файлов проекта: `hexstrike_server.py`, `hexstrike_mcp.py`, `hexstrike_optimizer.py`, `hexstrike_guardrails/`, `pentest_session.py`, `task_store.py`, `schemas/`, `templates/`, `VERSION`, `requirements.txt`; подготовка `data/` для SQLite
 3. Создание venv с `--system-site-packages`
 4. Установка зависимостей через pip
 5. Генерация gunicorn wrapper (включая `~/.cargo/bin` для rustscan)
@@ -326,7 +330,7 @@ sudo systemctl enable --now hexstrike-mcp   # поднимает MCP на :9010
 
 ## Тесты и разработка
 
-Начиная с v6.3.0 проект покрыт unit-тестами (pytest) на «чистые» функции без I/O. В v6.4.0 тестовое покрытие масштабно расширено: добавлены тесты на весь пакет `hexstrike_guardrails/`, `pentest_session.py` и на legacy-эксплойт-генераторы. В v6.4.5 добавлены тесты на MCP-консолидацию (профили, глаголы, алиасы, guardrails для metasploit). Всего **456 тестов** (115 → 415 → 456).
+Начиная с v6.3.0 проект покрыт unit-тестами (pytest) на «чистые» функции без I/O. В v6.4.0 тестовое покрытие масштабно расширено: добавлены тесты на весь пакет `hexstrike_guardrails/`, `pentest_session.py` и на legacy-эксплойт-генераторы. В v6.4.5 добавлены тесты на MCP-консолидацию (профили, глаголы, алиасы, guardrails для metasploit). Всего **504 теста** (115 → 415 → 456 → 504). В v6.4.7 добавлены тесты на input-валидацию (37: hostname/IPv4/IPv6/CIDR, reject shell-метасимволов/CRLF/null, argv-form Popen, `_shell_split`) и на персистентное task-хранилище (11: lifecycle, recover после recycle воркера, cleanup).
 
 ### Установка dev-зависимостей
 
@@ -527,6 +531,36 @@ Server-side фильтрация инструментов через env-пер�
 ### Совместимость
 
 На 100% обратно совместимо. Default поведение (`HEXSTRIKE_MCP_PROFILE=full + HEXSTRIKE_MCP_ALIASES=1`) сохраняет все 25 существующих имён инструментов + добавляет 7 новых = 32. Существующие AGENTS.md, сохранённые диалоги, кастомные промпты работают без изменений. Экономия токенов — **opt-in** через lean-профили.
+
+---
+
+## Hardening: command injection + персистентные задачи (v6.4.7)
+
+Security-релиз по итогам глубокого аудита проекта (код, зависимости, деплой). Полный список изменений — в [CHANGELOG.md](CHANGELOG.md).
+
+### Фикс command injection
+
+Ранее команды инструментов собирались f-строками из сырого `request.json` и исполнялись через `subprocess.Popen(command, shell=True)` без санитизации — любой параметр вида `8090; id` приводил к выполнению произвольного shell-кода от имени сервиса. Теперь:
+
+- `EnhancedCommandExecutor` принимает argv-списки и всегда исполняет с `shell=False`; легитимные флаги проходят как токены, shell-метасимволы теряют спецзначение;
+- `validate_target` / `validate_url` реджектят `;`, `$()`, backticks, CRLF и null-bytes до spawn'а процесса; `additional_args` парсится через `shlex.split`;
+- переведены на list-form все критичные роуты (`nmap`, `gobuster`, `nuclei`, `sqlmap`, `metasploit`, `hydra`, `netexec` + 17 smart-scan helper'ов); `netexec` получил allowlist протоколов;
+- фиксированный `/tmp/mcp_msf_resource.rc` заменён на `tempfile.mkstemp` (symlink-атака устранена);
+- полная команда redact'ится перед логированием — пароли больше не попадают в `hexstrike.log`.
+
+100% backward-совместимость для легитимных вызовов: валидные target/url/флаги проходят без изменений.
+
+### Guardrails в пути исполнения
+
+`wrap_executor` (написан в v6.4.0, но не имевший ни одного вызова) теперь оборачивает `execute_command_with_recovery`: scope-валидация, tier-подтверждение, kill switch и rate-limiting применяются ко всем диспетчеризациям инструментов. Обёртка defensive — при недоступности guardrails-DB executor продолжит работу.
+
+### Персистентные async-задачи
+
+Новый `task_store.py` + таблица `async_tasks` в общей SQLite: lifecycle задач (`queued → running → completed/failed/lost`) дублируется на диск, `recover()` на старте воркера помечает потерянные задачи как `lost` — после gunicorn recycle (`--max-requests 1000`) poll возвращает честный статус вместо `not_found`. `cleanup_old(days=7)` не даёт таблице расти бесконечно.
+
+### Лицензия
+
+Добавлен `LICENSE` (MIT) с атрибуцией m0x4m4 → netcuter → Chumikov. Без него форк формально был нераспространяемым.
 
 ---
 

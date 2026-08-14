@@ -117,3 +117,30 @@ CREATE TABLE IF NOT EXISTS metadata (
 -- Seed: empty default scope (allow-all). Updated via PUT /api/guardrails/scope.
 INSERT OR IGNORE INTO metadata(key, value) VALUES ('default_scope_rules', '[]');
 INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', 'v6.4.0');
+
+-- ============================================================================
+-- Async tasks (v6.4.7) — persistent task store for the ProcessPool
+-- ============================================================================
+-- Survives gunicorn --max-requests worker recycles. Previously the pool kept
+-- task state purely in-process (self.results / self.active_tasks dicts), so a
+-- worker recycle every 1000 requests silently destroyed every in-flight and
+-- completed-but-unpolled task. This table makes task state durable so a poll
+-- after a recycle still returns the recorded result, and a started-but-lost
+-- task (worker SIGKILLed mid-scan) is marked 'lost' on the next boot.
+CREATE TABLE IF NOT EXISTS async_tasks (
+    id            TEXT PRIMARY KEY,                            -- uuid4().hex[:16]
+    status        TEXT NOT NULL DEFAULT 'queued',              -- queued | running | completed | failed | lost
+    command       TEXT,                                        -- logged (redacted) command for audit
+    tool          TEXT,                                        -- tool_name if known
+    target        TEXT,                                        -- validated target if known
+    result        TEXT,                                        -- JSON-encoded result dict
+    error         TEXT,                                        -- error message on failure
+    worker_id     INTEGER,
+    submitted_at  TEXT NOT NULL,                               -- RFC3339 UTC
+    started_at    TEXT,
+    completed_at  TEXT,
+    execution_time_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_async_tasks_status ON async_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_async_tasks_submitted ON async_tasks(submitted_at);
+

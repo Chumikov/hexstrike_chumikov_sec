@@ -135,6 +135,13 @@ else
     warn "pentest_session.py не найден — /api/session/* отключены"
 fi
 
+if [[ -f "${SCRIPT_DIR}/task_store.py" ]]; then
+    cp "${SCRIPT_DIR}/task_store.py" "${HEXSTRIKE_DIR}/task_store.py"
+    ok "task_store.py скопирован (v6.4.7: персистентное task-хранилище)"
+else
+    warn "task_store.py не найден — async-задачи не переживут gunicorn recycle"
+fi
+
 if [[ -d "${SCRIPT_DIR}/schemas" ]]; then
     mkdir -p "${HEXSTRIKE_DIR}/schemas"
     cp -a "${SCRIPT_DIR}/schemas/." "${HEXSTRIKE_DIR}/schemas/"

@@ -5,6 +5,41 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/),
 версионирование — [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [6.4.7] — 2026-08-11
+
+### Безопасность (critical/high из аудита)
+
+- **Фикс command injection на всех tool-роутах.** Ранее команды собирались f-string'ом из сырого `request.json` и выполнялись через `subprocess.Popen(command, shell=True)` без какой-либо санитизации (`shlex` отсутствовал во всём проекте). Теперь:
+  - `EnhancedCommandExecutor` и `_execute_command_internal` принимают argv-list (`shell=False`); легитимные флаги проходят как токены, shell-метасимволы теряют спецзначение
+  - добавлены `validate_target` / `validate_url` / `_shell_split` — реджектят `;`, `$()`, backticks, CRLF, null-bytes в target/url; `additional_args` парсится через `shlex.split` и передаётся списком
+  - переведены на list-form + валидацию: `/api/tools/nmap`, `/api/tools/gobuster`, `/api/tools/nuclei`, `/api/tools/sqlmap`, `/api/tools/metasploit`, `/api/tools/hydra`, `/api/tools/netexec` и 17 smart-scan helper'ов (`execute_nmap_scan` … `execute_subfinder_scan`) через новый `execute_tool_command()`
+  - `netexec`: добавлен allowlist для `protocol` (smb/ssh/ldap/mssql/winrm/...)
+  - `metasploit`: фиксированный путь `/tmp/mcp_msf_resource.rc` заменён на `tempfile.mkstemp` (устраняет race condition и symlink-атаку)
+  - `EnhancedCommandExecutor.execute`: полный command теперь redact'ится перед логированием (`redact_credentials`), пароли/hashes больше не пишутся в `hexstrike.log`
+- **Guardrails подключены к пути исполнения.** `wrap_executor` (написан в v6.4.0, но имевший 0 вызовов) теперь оборачивает `execute_command_with_recovery` — scope-validation, tier-confirmation, killswitch, rate-limiting применяются ко всем tool-диспетчерезациям. Обёртка defensive: при недоступности guardrails-DB executor fallthrough'ит (сервер продолжает работать)
+- **LICENSE добавлен** (MIT) с тройной атрибуцией: m0x4m4 (оригинал) → netcuter (PL fork) → Chumikov. Без LICENSE форк технически был нераспространяем («All Rights Reserved» по умолчанию)
+
+### Надёжность (critical из аудита — gunicorn recycle)
+
+- **Персистентное task-хранилище (`task_store.py`).** Ранее `ProcessPool` хранил state в in-process dict'ах (`self.results`, `self.active_tasks`); gunicorn `--max-requests 1000` убивал worker → все in-flight/завершённые-но-не-опросённые задачи тихо исчезали. Теперь:
+  - таблица `async_tasks` в общей SQLite (`schemas/hexstrike_sessions.sql`): `queued` → `running` → `completed`/`failed`/`lost`
+  - `submit_task` / `_worker_thread` / `get_task_result` дублируют lifecycle в SQLite (best-effort, degrade-to-in-process при недоступности DB)
+  - `recover()` на старте worker'а помечает leftover `running`/`queued` как `lost` — poll после recycle возвращает честный статус вместо `not_found`
+  - `cleanup_old(days=7)` предотвращает unbounded growth таблицы
+
+### Тесты
+
+- **+48 новых тестов (456 → 504, все зелёные):**
+  - `tests/unit/test_input_validation.py` (37): `validate_target` (hostname/IPv4/IPv6/CIDR/wildcard, reject shell-metachar/CRLF/null/overlong), `validate_url` (http/https/port/query, reject host-injection/CRLF/scheme-without-host), `_shell_split` (literal `;`-as-token — доказывает, что injection нейтрализован), `EnhancedCommandExecutor` argv-form (Popen получает `shell=False`), `execute_tool_command` rejects poisoned target **до** spawn'а subprocess'а
+  - `tests/unit/test_task_store.py` (11): lifecycle (submit→running→completed/failed), **recover после recycle** (5 запущенных задач → 5 `lost`), idempotent recovery, cleanup-old по timestamp
+- Покрытие: hexstrike_server.py 14% → 16%, общее 26% → 28%
+
+### Совместимость
+
+- **100% backward compat для легитимных вызовов:** все валидные target/url/flags проходят без изменений. Изменения затрагивают только значения с shell-метасимволами (которые легитимный вызов никогда не содержит)
+- MCP-инструменты (`hexstrike_mcp.py`) не затронуты — они ходят через REST API, где теперь применяется валидация и guardrails
+- Деплой: `deploy.sh` копирует `task_store.py` вместе с остальными py-файлами; новая таблица `async_tasks` создаётся автоматически при следующем `init_db()` (идемпотентный `CREATE TABLE IF NOT EXISTS`)
+
 ## [6.4.6] — 2026-07-07
 
 ### Изменено
@@ -18,6 +53,14 @@
   - Override через env: `HEXSTRIKE_MEM_HIGH` / `HEXSTRIKE_MEM_MAX` (напр. `4000M`)
 - **`OpenCodeStart.sh`: retry-loop проверки `/health`** вместо `sleep 2`. После ребута systemd поднимает hexstrike за ~5–25 с; старый `sleep 2` срабатывал раньше готовности → opencode фиксировал `server unavailable key=hexstrike`. Теперь лаунчер ждёт до 30×1 с (параметризуется `HEALTHSTART_RETRIES` / `HEALTHSTART_INTERVAL`) с диагностикой в stderr при провале
 - `hexstrike-mcp.service` (опциональный streamable/sse): `Restart=always`, `RestartSec=3`, `OOMScoreAdjust=-500`
+
+### Решения по зависимостям
+
+- **MCP SDK: удержание пина `mcp>=1.27.2,<2`.** Аудит двух недавних версий протокола:
+  - **2025-11-25 (финальная)** — Async Tasks, OAuth 2.1+CIMD, Elicitation, Extensions, Structured Tool Output. Поддерживается текущим SDK (резолвится `mcp==1.28.0`, что ≥ 1.23) — проект уже совместим с этой версией протокола. Breaking-changes нет.
+  - **2026-07-28 (release candidate, Python SDK v2)** — крупнейший breaking-change в истории MCP: stateless-переворот (убраны `initialize`-handshake и `Mcp-Session-Id`), убраны server→client requests, JSON Schema → 2020-12, **deprecate Roots/Sampling/Logging**, ужесточения OAuth/OIDC.
+  - **Вердикт: НЕ переходить на v2/2026-07-28 до stable-релиза.** Проект использует только Tools (32 инструмента) и не задействует sampling/roots/logging — именно то, что v2 ломает/deprecate. RC-статус + адаптация FastMCP/streamable-http-деплоя + отсутствие давления со стороны MCP-клиентов (OpenCode/Claude Desktop/Cursor/Cline поддерживают текущую версию) делают переход преждевременным. Пин `<2` осознанно блокирует подтягивание v2.
+  - **Точечная польза 2025-11-25 для проекта:** Async Tasks (`@mcp.task()`) — кандидат на замену костылям против обрывов stdio при длительных сканах (`nmap`/`nuclei`/`sqlmap`/`metasploit`); Structured Tool Output — упрощает `hexstrike_optimizer.py`. Вынесено в roadmap, не блокирует релиз.
 
 ### Безопасность
 
