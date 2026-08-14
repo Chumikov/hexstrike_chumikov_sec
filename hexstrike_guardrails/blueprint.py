@@ -116,6 +116,7 @@ def build_guardrails_bp() -> Blueprint:
         target = data.get("target")
         if not isinstance(target, str) or not target.strip():
             return jsonify({"error": "target must be a non-empty string"}), 400
+        state.refresh_scope()  # another worker may have updated the rules
         in_scope, matched = state.scope_validator.validate(target)
         return jsonify({
             "target": target,
@@ -273,6 +274,12 @@ def wrap_executor(
         # best-effort. Most call sites use kwargs (see hexstrike_server.py).
         if not tool and args:
             tool = str(args[0])
+        # execute_command_with_recovery(tool_name, command, parameters, ...)
+        # is usually called POSITIONALLY — params must come from args[2] or
+        # the scope/rate gates see no target and wave everything through
+        # (found by the synthetic lab: an out-of-scope nmap ran for real).
+        if params is None and len(args) >= 3 and isinstance(args[2], dict):
+            params = args[2]
         if target is None and isinstance(params, dict):
             target = params.get("target") or params.get("host")
 

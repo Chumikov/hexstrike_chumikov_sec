@@ -92,6 +92,7 @@ hexstrike_mcp.py  ──HTTP──►  hexstrike_server.py (Flask + gunicorn, :8
 | `templates/health_panel.html` | Шаблон HTML-панели мониторинга |
 | `scripts/sync-upstream.sh` | Maintenance-синхронизация с upstream |
 | `tests/` | Unit-тесты (pytest) |
+| `scripts/synthetic_lab.py` | Синтетический полигон: функциональные сценарии + инъекции/guardrails/robustness (52 проверки) |
 | `.github/workflows/ci.yml` | CI: pytest на каждый push/PR |
 | `VERSION` / `CHANGELOG.md` | Версия (SemVer) и история релизов |
 
@@ -186,6 +187,8 @@ Per-target caps, чтобы не «уложить» цель и не тригг�
 | `GUARDRAILS_MAX_CONCURRENT` | `5` | Лимит одновременных запросов на цель |
 | `GUARDRAILS_MAX_RPS` | `10` | Лимит запросов в секунду на цель |
 | `GUARDRAILS_RATE_TIMEOUT` | `0.0` | Блокирующее ожидание при превышении (сек) |
+
+Лимиты применяются **на gunicorn-воркер** (состояние in-process); при sync-воркерах фактическая конкурентность на цель не превышает числа воркеров.
 
 Kill switch — аварийный стоп-кран: один HTTP-вызов останавливает все процессы сессии или глобально (SIGTERM → grace period → SIGKILL). Флаг персистентен, виден всем воркерам gunicorn.
 

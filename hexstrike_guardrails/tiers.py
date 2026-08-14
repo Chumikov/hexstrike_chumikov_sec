@@ -210,6 +210,13 @@ def classify_tool(name: str, params: Optional[Dict[str, Any]] = None) -> Tier:
         if key == "execute_command":
             # Arbitrary command execution — always destructive, no exceptions.
             return Tier.DESTRUCTIVE
+        if key == "nmap-advanced":
+            # Route name (not in TOOL_TIERS — token fallback would call it
+            # INTRUSIVE). aggressive=true means `nmap -A` (OS detect + script
+            # scan + traceroute) — same deal as the mapping-level rule for
+            # nmap_advanced_scan.
+            if params.get("aggressive") in (True, "true", "True", 1, "1"):
+                return Tier.DESTRUCTIVE
         if key == "create_file":
             # Writes arbitrary content to the server filesystem.
             return Tier.DESTRUCTIVE

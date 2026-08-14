@@ -174,7 +174,34 @@ class GuardrailsState:
             self.scope_validator = new_validator
         _store_scope_rules(rules)
 
+    def refresh_scope(self) -> None:
+        """Reload scope rules from the DB if another process changed them.
+
+        ``update_scope`` persists to SQLite, but rules were previously read
+        only in ``__init__`` — a gunicorn worker that booted before an
+        update kept enforcing the old (possibly empty) scope, so a scope set
+        via worker A never blocked dispatches served by worker B. One cheap
+        SELECT per check keeps every worker honest.
+        """
+        try:
+            rules = _load_scope_rules()
+        except Exception:  # pragma: no cover - defensive
+            return
+        with self._lock:
+            current = self.scope_validator.to_raw_list()
+        if rules == current:
+            return
+        try:
+            new_validator = ScopeValidator(rules)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("guardrails: refusing corrupt scope rules from DB")
+            return
+        with self._lock:
+            self.scope_validator = new_validator
+        logger.info("guardrails: scope reloaded from DB (%d rules)", len(rules))
+
     def get_scope(self) -> List[str]:
+        self.refresh_scope()
         with self._lock:
             return self.scope_validator.to_raw_list()
 
@@ -194,6 +221,9 @@ class GuardrailsState:
         with the dispatch.
         """
         start = time.time()
+        # cross-worker freshness: another gunicorn worker may have updated
+        # the scope (or engaged the kill switch) since this process booted
+        self.refresh_scope()
         tier = classify_tool(tool, params)
 
         # 1) Global kill switch.

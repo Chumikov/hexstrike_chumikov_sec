@@ -10,6 +10,8 @@ Covers the four confirmed bugs + the audit-coverage observation:
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 server = pytest.importorskip("hexstrike_server")
@@ -35,21 +37,31 @@ class TestNmapAdvancedCommand:
     def test_default_script_set_is_target_scoped(self):
         argv, _ = server.build_nmap_advanced_command(self.BASE)
         scripts = [a for a in argv if a.startswith("--script=")]
-        assert any(a == "--script=default,safe" for a in scripts)
         # BUG-2: the old default was default,discovery,safe — discovery pulls
         # in the broadcast/* NSE family (L2 shout, neighbour sniffing).
-        assert not any("discovery" in a for a in scripts)
+        assert any(a.startswith("--script=default,safe") for a in scripts)
+        # discovery may appear only inside the AND-NOT exclusion chain,
+        # never as an enabled OR-item (",discovery" / "discovery,")
+        assert not any(re.search(r",discovery|discovery,", a) for a in scripts)
 
-    def test_broadcast_scripts_explicitly_excluded(self):
+    _EXCL = " and not broadcast and not discovery and not external"
+
+    def test_offtarget_script_categories_excluded_via_chained_and_not(self):
+        # nmap has no --script-exclude; comma is OR (matches everything),
+        # parentheses are unsupported, and `safe` alone still contains
+        # discovery/external scripts (targets-asn ran as pre-scan in the
+        # synthetic lab). Only chained AND-NOT excludes (nmap 7.99 verified).
         argv, _ = server.build_nmap_advanced_command(self.BASE)
-        assert "--script-exclude=broadcast" in argv
+        scripts = [a for a in argv if a.startswith("--script=")]
+        assert any(a == f"--script=default,safe{self._EXCL}" for a in scripts)
+        assert not any("--script-exclude" in a for a in argv)
 
-    def test_broadcast_excluded_even_with_custom_scripts(self):
+    def test_custom_scripts_get_same_exclusions(self):
         argv, err = server.build_nmap_advanced_command(
             {**self.BASE, "nse_scripts": "vuln,safe"})
         assert err is None
-        assert "--script=vuln,safe" in argv
-        assert "--script-exclude=broadcast" in argv
+        assert f"--script=vuln,safe{self._EXCL}" in argv
+        assert not any(a.startswith("--script=default") for a in argv)
 
     def test_host_and_script_timeouts_present(self):
         argv, _ = server.build_nmap_advanced_command(self.BASE)
@@ -305,6 +317,67 @@ class TestApiCommandGuardrails:
         assert ks_b.is_engaged() is True
         ks_a.reset()
         assert ks_b.is_engaged() is False
+
+    def test_scope_visible_across_workers(self, guardrails_db):
+        # Same class of bug, found by the synthetic lab: a scope set via
+        # worker A never blocked dispatches in worker B, because rules were
+        # only loaded in GuardrailsState.__init__. check() must refresh.
+        from hexstrike_guardrails.state import GuardrailsState
+        state_a, state_b = GuardrailsState(), GuardrailsState()
+        state_a.update_scope(["10.0.0.0/8"])
+        # worker B still holds a stale (empty) scope in memory
+        decision = state_b.check("nmap", "192.0.2.1")
+        assert decision.allowed is False
+        assert decision.reason == "scope"
+        decision = state_b.check("nmap", "10.0.0.5")
+        assert decision.allowed is True
+        state_a.update_scope([])
+
+    def test_nmap_advanced_aggressive_promoted_to_destructive(self, fresh_state):
+        from hexstrike_guardrails import Tier, classify_tool
+        # tier gap found by the lab: /api/tools/nmap-advanced with
+        # aggressive=true (nmap -A) ran without DESTRUCTIVE confirmation
+        assert classify_tool("nmap-advanced", {"aggressive": True}) is Tier.DESTRUCTIVE
+        assert classify_tool("nmap-advanced", {"aggressive": False}) is Tier.INTRUSIVE
+
+    def test_bad_json_body_is_400_not_500(self, client):
+        # Synthetic robustness probe: any non-JSON body used to surface as
+        # HTTP 500 (routes' except-Exception swallowed the HTTPException
+        # raised by request.json).
+        resp = client.post("/api/tools/nmap", data="not json",
+                           content_type="text/plain")
+        assert resp.status_code == 400
+        resp = client.post("/api/tools/nmap", json=[1, 2, 3])
+        assert resp.status_code == 400
+
+    def test_validate_url_rejects_garbage_netloc(self):
+        # urlparse happily returned hostname="127.0.0.1" for
+        # "http://127.0.0.1:1; echo x" — the port part was never validated,
+        # so poisoned URLs sailed through validate_url.
+        with pytest.raises(ValueError):
+            server.validate_url("http://127.0.0.1:1; echo pwned")
+        with pytest.raises(ValueError):
+            server.validate_url("http://127.0.0.1:abc/x")
+
+    def test_wrap_executor_sees_positional_params(self, fresh_state):
+        # execute_command_with_recovery is called POSITIONALLY as
+        # (tool_name, command, parameters) — wrap_executor used to read
+        # parameters only from kwargs, so the scope gate saw no target and
+        # an out-of-scope nmap ran for real (synthetic lab finding).
+        from hexstrike_guardrails import GuardrailsBlocked, wrap_executor
+        fresh_state.update_scope(["10.0.0.0/8"])
+        calls = []
+        def fake_executor(tool_name, command, parameters=None, **kw):
+            calls.append((tool_name, parameters))
+            return {"success": True}
+        guarded = wrap_executor(fake_executor)
+        with pytest.raises(GuardrailsBlocked):
+            guarded("nmap", ["nmap", "192.0.2.1"], {"target": "192.0.2.1"})
+        assert calls == []  # blocked before reaching the executor
+        # in-scope positional call goes through with params visible
+        guarded("nmap", ["nmap"], {"target": "10.0.0.5"})
+        assert calls == [("nmap", {"target": "10.0.0.5"})]
+        fresh_state.update_scope([])
 
     def test_tool_and_target_inference(self):
         assert server._infer_bare_tool("nmap -sV 10.0.0.1") == "nmap"

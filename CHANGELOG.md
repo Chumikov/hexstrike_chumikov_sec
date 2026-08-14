@@ -5,6 +5,41 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/),
 версионирование — [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [6.4.9] — 2026-08-14
+
+Результаты комплексного синтетического тестирования (`scripts/synthetic_lab.py`): полигон на 127.0.0.1 (веб-сервер с директориями/страницами/«уязвимым» параметром) + батареи инъекций/guardrails/robustness. Первый прогон — 30/52, после фиксов — 52/52. Заодно полигон поймал два бага в фиксаx v6.4.8/v6.4.7.
+
+### Критические
+
+- **Scope-гейт был слеп для tool-роутов: вне-scope nmap реально исполнялся.** `wrap_executor` читал `parameters` только из kwargs, а `execute_command_with_recovery(tool_name, command, parameters)` везде вызывается позиционно → target=None → scope/rate-гейты пропускали всё. Теперь параметры достаются и из позиционных аргументов (`args[2]`).
+- **Scope не был виден между gunicorn-воркерами** (как kill-флаг до v6.4.8): правила читались из SQLite только в `GuardrailsState.__init__` — scope, установленный через воркер A, не блокировал вызовы в воркере B. `check()` теперь обновляет правила из DB (`refresh_scope()`); `validate`-эндпоинт тоже.
+- **7 инъекционных роутов (подтверждённый RCE)**: `nikto`, `dalfox`, `prowler`, `wpscan`, `autorecon`, `enum4linux-ng`, `gdb`, `radare2` (+ `dirsearch` и `sqlmap` без подтверждения) — переведены на argv-форму (`shell=False`) с валидацией target/url/путей, guardrails-диспетчеризацией и mkstemp вместо фиксированных `/tmp/*_commands.txt` (symlink-атака).
+
+### Безопасность / корректность
+
+- **sqlmap исполнялся в обход guardrails** (голый `execute_command`): DESTRUCTIVE-инструмент без tier-подтверждения, scope и audit. Теперь через `execute_tool_command`; параметр `target` принят как алиас к `url`.
+- **Guardrails-блоки возвращали HTTP 200** (`execute_tool_command` переводит блок в dict для smart-scan): роуты теперь отдают честные 403/429/503 через `_tool_response()`.
+- **`nmap-advanced aggressive=true` не требовал подтверждения** (nmap -A = DESTRUCTIVE по собственной модели проекта): добавлен params-aware promote в `classify_tool`.
+- **`validate_url` пропускал мусорный netloc** (`http://h:1; echo x` валидировался по одному hostname): обращение к `.port` теперь строго валидирует порт.
+- **Мусорное тело запроса → 500** (не-JSON, JSON-массив): `request.json` в роутах заменён на `_json_params()` (111 вхождений) — всегда dict, ошибки тела = 400.
+
+### Функциональные
+
+- **`whatweb` не имел роута вовсе** — health-панель и decision-engine на него ссылались, любой вызов 404. Добавлен `/api/tools/whatweb` (argv, guardrails).
+- **dirsearch падал на каждом вызове**: Kali-сборка создаёт `reports/` в CWD (независимо от `-o`), CWD сервиса не доступен на запись. Экзекутор получил параметр `cwd`; dirsearch запускается во временном каталоге, отчёт — по возвращаемому пути `report_file`.
+- **wpscan зависал на многие минуты** (проверка обновлений БД/обращения к wpscan.com при недоступной цели): добавлены `--no-update --disable-tls-checks`.
+- **`--script-exclude=broadcast` — несуществующий флаг nmap** (баг в фиксе BUG-2 из v6.4.8): каждый full-скан умирал rc=255. Правильное исключение — chained AND-NOT: `--script=default,safe and not broadcast and not discovery and not external` (запятая = OR, скобки не поддерживаются, а `safe` сам содержит discovery/external скрипты вроде targets-asn — проверено на nmap 7.99).
+- nmap/gobuster/nuclei: `use_recovery=False` ветка исполнялась в обход guardrails — объединено на guarded-пути.
+
+### Известные ограничения (задокументировано)
+
+- Rate limiter: лимиты (`GUARDRAILS_MAX_CONCURRENT=5`, `GUARDRAILS_MAX_RPS=10`) применяются **на gunicorn-воркер**; при sync-воркерах фактическая конкурентность на цель ≤ числа воркеров, concurrency-гейт практически недостижим. Shared-лимитер — кандидат на v6.5+.
+
+### Тесты и инструментарий
+
+- +12 unit-тестов (550 всего): позиционные параметры wrap_executor, кросс-воркерный scope, tier-promotion, мусорные тела, strict-port URL, новые nmap-выражения.
+- **`scripts/synthetic_lab.py`** — воспроизводимый полигон (52 проверки): функциональные сценарии (port_scan/http_probe/directory_brute/web_vuln_scan/cloud_audit/execute_command на живых инструментах), workflow (сессии, scope, async + выживание при рестарте), инъекционная батарея, robustness. Запуск: `python3 scripts/synthetic_lab.py [--quick|--skip-restart]`.
+
 ## [6.4.8] — 2026-08-14
 
 Фиксы по отчёту полевых испытаний v6.4.7 (CTF-уикенд на ctf.bug-makers.ru): 4 подтверждённых бага + наблюдение об audit-покрытии.

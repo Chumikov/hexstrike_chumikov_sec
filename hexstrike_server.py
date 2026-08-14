@@ -37,6 +37,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 from collections import OrderedDict
 import shutil
+import tempfile
 import venv
 import zipfile
 from pathlib import Path
@@ -195,6 +196,10 @@ def validate_url(url: str) -> str:
         from urllib.parse import urlparse
         parsed = urlparse(cleaned)
         host = parsed.hostname
+        # Accessing .port VALIDATES it: "http://h:1; echo x" parses with
+        # hostname="h" but port="1; ..." raises ValueError here (synthetic
+        # lab: poisoned URLs sailed through on the hostname alone).
+        _ = parsed.port
     except Exception:
         host = None
     # If we have a scheme:// the host must be present and clean. If there is
@@ -231,6 +236,46 @@ def _shell_split(additional_args: str) -> list:
         return shlex.split(additional_args)
     except ValueError as exc:
         raise ValueError(f"additional_args is not valid shell syntax: {exc}")
+
+def _host_of(url: str) -> str:
+    """Extract the hostname from a URL for guardrails scope/rate checks.
+
+    Falls back to the raw string when nothing parses — the scope validator
+    normalises the value anyway and refuses to fail open.
+    """
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname
+    except Exception:
+        host = None
+    return host or url
+
+def _validate_fs_path(value: str, what: str = "path") -> str:
+    """Validate a user-supplied filesystem path argument.
+
+    Allows plain paths (letters, digits, / . _ -), rejects shell
+    metacharacters, spaces, traversal-injection tricks and null bytes. Used
+    for tool params that are paths (output_dir, binary, script_file) on
+    routes still executing via the legacy shell path or passed to argv.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{what} must be a non-empty string")
+    if "\x00" in value or len(value) > 4096:
+        raise ValueError(f"{what} contains null byte or is too long")
+    if not re.fullmatch(r"[A-Za-z0-9_./~+-]+", value):
+        raise ValueError(f"{what} contains forbidden characters: {value!r}")
+    return value
+
+def _json_params() -> Dict[str, Any]:
+    """Request body as a dict — never raises, never returns a non-dict.
+
+    Replaces bare ``request.json`` in tool routes: invalid JSON / wrong
+    content-type used to raise inside the route try-block and surface as
+    HTTP 500 (found by the synthetic robustness battery), and a valid
+    JSON array/list crashed ``params.get``.
+    """
+    body = request.get_json(silent=True)
+    return body if isinstance(body, dict) else {}
 
 def validate_api_key(request) -> bool:
     """Validate API key from request headers"""
@@ -6999,7 +7044,8 @@ class EnhancedCommandExecutor:
     """Enhanced command executor with caching, progress tracking, and better output handling"""
 
     def __init__(self, command, timeout: int = COMMAND_TIMEOUT,
-                 max_output_bytes: int = None, stdin_data: str = None):
+                 max_output_bytes: int = None, stdin_data: str = None,
+                 cwd: str = None):
         # command may be either:
         #   - a str        → executed with shell=True  (legacy path; only for
         #                    trusted, already-built commands such as /api/command
@@ -7017,6 +7063,9 @@ class EnhancedCommandExecutor:
         self._cap_kill_done = False
         # Optional stdin payload (e.g. feed the target list to httpx).
         self.stdin_data = stdin_data
+        # Optional working directory (e.g. dirsearch insists on creating a
+        # relative reports/ folder in the CWD — point it at a temp dir).
+        self.cwd = cwd
         self.process = None
         self.stdout_data = ""
         self.stderr_data = ""
@@ -7157,7 +7206,8 @@ class EnhancedCommandExecutor:
                 stderr=subprocess.PIPE,
                 stdin=subprocess.PIPE if self.stdin_data is not None else None,
                 text=True,
-                bufsize=1
+                bufsize=1,
+                cwd=self.cwd,
             )
 
             if self.stdin_data is not None:
@@ -8930,7 +8980,8 @@ exploit_generator = AIExploitGenerator()
 vulnerability_correlator = VulnerabilityCorrelator()
 
 def execute_command(command, use_cache: bool = True,
-                    stdin_data: str = None, max_output_bytes: int = None) -> Dict[str, Any]:
+                    stdin_data: str = None, max_output_bytes: int = None,
+                    cwd: str = None) -> Dict[str, Any]:
     """
     Execute a shell command with enhanced features
 
@@ -8965,7 +9016,7 @@ def execute_command(command, use_cache: bool = True,
 
     # Execute command
     executor = EnhancedCommandExecutor(
-        command, stdin_data=stdin_data, max_output_bytes=max_output_bytes
+        command, stdin_data=stdin_data, max_output_bytes=max_output_bytes, cwd=cwd
     )
     result = executor.execute()
 
@@ -8977,7 +9028,8 @@ def execute_command(command, use_cache: bool = True,
 
 def execute_command_with_recovery(tool_name: str, command: str, parameters: Dict[str, Any] = None,
                                  use_cache: bool = True, max_attempts: int = 3,
-                                 stdin_data: str = None, max_output_bytes: int = None) -> Dict[str, Any]:
+                                 stdin_data: str = None, max_output_bytes: int = None,
+                                 cwd: str = None) -> Dict[str, Any]:
     """
     Execute a command with intelligent error handling and recovery
 
@@ -9004,7 +9056,7 @@ def execute_command_with_recovery(tool_name: str, command: str, parameters: Dict
         try:
             # Execute the command
             result = execute_command(command, use_cache, stdin_data=stdin_data,
-                                     max_output_bytes=max_output_bytes)
+                                     max_output_bytes=max_output_bytes, cwd=cwd)
 
             # Check if execution was successful
             if result.get("success", False):
@@ -9759,7 +9811,7 @@ def generic_command():
 def create_file():
     """Create a new file"""
     try:
-        params = request.json
+        params = _json_params()
         filename = params.get("filename", "")
         content = params.get("content", "")
         binary = params.get("binary", False)
@@ -9777,7 +9829,7 @@ def create_file():
 def modify_file():
     """Modify an existing file"""
     try:
-        params = request.json
+        params = _json_params()
         filename = params.get("filename", "")
         content = params.get("content", "")
         append = params.get("append", False)
@@ -9795,7 +9847,7 @@ def modify_file():
 def delete_file():
     """Delete a file or directory"""
     try:
-        params = request.json
+        params = _json_params()
         filename = params.get("filename", "")
 
         if not filename:
@@ -9823,7 +9875,7 @@ def list_files():
 def generate_payload():
     """Generate large payloads for testing"""
     try:
-        params = request.json
+        params = _json_params()
         payload_type = params.get("type", "buffer")
         size = params.get("size", 1024)
         pattern = params.get("pattern", "A")
@@ -10420,7 +10472,7 @@ def intelligent_smart_scan():
 # Helper functions for intelligent smart scan tool execution
 def execute_tool_command(tool_name: str, argv: list, target: str,
                          params: Dict[str, Any] = None,
-                         stdin_data: str = None) -> Dict[str, Any]:
+                         stdin_data: str = None, cwd: str = None) -> Dict[str, Any]:
     """Run a tool via argv list (shell=False) through guardrails.
 
     This is the single safe entry point for smart-scan helpers. It:
@@ -10446,7 +10498,7 @@ def execute_tool_command(tool_name: str, argv: list, target: str,
     try:
         return execute_command_with_recovery(
             tool_name, list(argv), params or {"target": target},
-            stdin_data=stdin_data,
+            stdin_data=stdin_data, cwd=cwd,
         )
     except Exception as exc:
         # GuardrailsBlocked surfaces as a structured dict via the blueprint's
@@ -10464,6 +10516,20 @@ def execute_tool_command(tool_name: str, argv: list, target: str,
         except Exception:
             pass
         return {"success": False, "error": str(exc)}
+
+
+def _tool_response(result):
+    """(jsonify, status) для tool-роутов.
+
+    execute_tool_command переводит GuardrailsBlocked в структурированный
+    dict (нужно smart-scan оркестратору), но HTTP-клиент должен видеть
+    честный статус: 403 scope/tier, 429 rate, 503 kill.
+    """
+    if isinstance(result, dict) and result.get("guardrails"):
+        reason = (result["guardrails"] or {}).get("reason")
+        status = {"rate": 429, "kill": 503}.get(reason, 403)
+        return jsonify(result), status
+    return jsonify(result)
 
 
 def execute_nmap_scan(target, params):
@@ -10988,7 +11054,7 @@ def create_comprehensive_bugbounty_assessment():
 def nmap():
     """Execute nmap scan with enhanced logging, caching, and intelligent error handling"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         scan_type = params.get("scan_type", "-sCV")
         ports = params.get("ports", "")
@@ -11020,20 +11086,20 @@ def nmap():
 
         logger.info(f"🔍 Starting Nmap scan: {target}")
 
-        # Use intelligent error handling if enabled (also drives guardrails)
-        if use_recovery:
-            tool_params = {
-                "target": target,
-                "scan_type": scan_type,
-                "ports": ports,
-                "additional_args": additional_args
-            }
-            result = execute_command_with_recovery("nmap", argv, tool_params)
-        else:
-            result = execute_command(argv)
+        # Guarded dispatch (scope/tier/kill/rate + audit); recovery is built
+        # into execute_command_with_recovery underneath. The legacy bare
+        # execute_command branch bypassed guardrails entirely.
+        tool_params = {
+            "target": target,
+            "scan_type": scan_type,
+            "ports": ports,
+            "additional_args": additional_args,
+            "use_recovery": use_recovery,
+        }
+        result = execute_tool_command("nmap", argv, target, tool_params)
 
         logger.info(f"📊 Nmap scan completed for {target}")
-        return jsonify(result)
+        return _tool_response(result)
 
     except Exception as e:
         logger.error(f"💥 Error in nmap endpoint: {str(e)}")
@@ -11045,7 +11111,7 @@ def nmap():
 def gobuster():
     """Execute gobuster with enhanced logging and intelligent error handling"""
     try:
-        params = request.json
+        params = _json_params()
         url = params.get("url", "")
         mode = params.get("mode", "dir")
         wordlist = params.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
@@ -11079,20 +11145,18 @@ def gobuster():
 
         logger.info(f"📁 Starting Gobuster {mode} scan: {url}")
 
-        # Use intelligent error handling if enabled (also drives guardrails)
-        if use_recovery:
-            tool_params = {
-                "target": url,
-                "mode": mode,
-                "wordlist": wordlist,
-                "additional_args": additional_args
-            }
-            result = execute_command_with_recovery("gobuster", argv, tool_params)
-        else:
-            result = execute_command(argv)
+        tool_params = {
+            "target": _host_of(url),
+            "mode": mode,
+            "wordlist": wordlist,
+            "additional_args": additional_args,
+            "use_recovery": use_recovery,
+        }
+        result = execute_tool_command("gobuster", argv, tool_params["target"],
+                                      tool_params)
 
         logger.info(f"📊 Gobuster scan completed for {url}")
-        return jsonify(result)
+        return _tool_response(result)
 
     except Exception as e:
         logger.error(f"💥 Error in gobuster endpoint: {str(e)}")
@@ -11104,7 +11168,7 @@ def gobuster():
 def nuclei():
     """Execute Nuclei vulnerability scanner with enhanced logging and intelligent error handling"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         severity = params.get("severity", "")
         tags = params.get("tags", "")
@@ -11141,21 +11205,18 @@ def nuclei():
 
         logger.info(f"🔬 Starting Nuclei vulnerability scan: {target}")
 
-        # Use intelligent error handling if enabled (also drives guardrails)
-        if use_recovery:
-            tool_params = {
-                "target": target,
-                "severity": severity,
-                "tags": tags,
-                "template": template,
-                "additional_args": additional_args
-            }
-            result = execute_command_with_recovery("nuclei", argv, tool_params)
-        else:
-            result = execute_command(argv)
+        tool_params = {
+            "target": target,
+            "severity": severity,
+            "tags": tags,
+            "template": template,
+            "additional_args": additional_args,
+            "use_recovery": use_recovery,
+        }
+        result = execute_tool_command("nuclei", argv, target, tool_params)
 
         logger.info(f"📊 Nuclei scan completed for {target}")
-        return jsonify(result)
+        return _tool_response(result)
 
     except Exception as e:
         logger.error(f"💥 Error in nuclei endpoint: {str(e)}")
@@ -11171,7 +11232,7 @@ def nuclei():
 def prowler():
     """Execute Prowler for AWS security assessment"""
     try:
-        params = request.json
+        params = _json_params()
         provider = params.get("provider", "aws")
         profile = params.get("profile", "default")
         region = params.get("region", "")
@@ -11180,31 +11241,42 @@ def prowler():
         output_format = params.get("output_format", "json")
         additional_args = params.get("additional_args", "")
 
-        # Ensure output directory exists
+        try:
+            if provider and not re.fullmatch(r"[a-z0-9-]+", provider):
+                raise ValueError(f"invalid provider: {provider!r}")
+            if profile and not re.fullmatch(r"[A-Za-z0-9_.\-@]+", profile):
+                raise ValueError(f"invalid profile: {profile!r}")
+            if region and not re.fullmatch(r"[a-z0-9-]+", region):
+                raise ValueError(f"invalid region: {region!r}")
+            if checks and not re.fullmatch(r"[A-Za-z0-9,._\- ]+", checks):
+                raise ValueError(f"invalid checks: {checks!r}")
+            if output_format and not re.fullmatch(r"[a-z0-9-]+", output_format):
+                raise ValueError(f"invalid output_format: {output_format!r}")
+            output_dir = _validate_fs_path(output_dir, "output_dir")
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-        command = f"prowler {provider}"
-
+        argv = ["prowler", provider]
         if profile:
-            command += f" --profile {profile}"
-
+            argv += ["--profile", profile]
         if region:
-            command += f" --region {region}"
-
+            argv += ["--region", region]
         if checks:
-            command += f" --checks {checks}"
-
-        command += f" --output-directory {output_dir}"
-        command += f" --output-format {output_format}"
-
+            argv += ["--checks", checks]
+        argv += ["--output-directory", output_dir, "--output-format", output_format]
         if additional_args:
-            command += f" {additional_args}"
+            try:
+                argv += _shell_split(additional_args)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
         logger.info(f"☁️  Starting Prowler {provider} security assessment")
-        result = execute_command(command)
+        result = execute_tool_command("prowler", argv, None, params)
         result["output_directory"] = output_dir
         logger.info(f"📊 Prowler assessment completed")
-        return jsonify(result)
+        return _tool_response(result)
     except Exception as e:
         logger.error(f"💥 Error in prowler endpoint: {str(e)}")
         return jsonify({
@@ -11215,7 +11287,7 @@ def prowler():
 def trivy():
     """Execute Trivy for container/filesystem vulnerability scanning"""
     try:
-        params = request.json
+        params = _json_params()
         scan_type = params.get("scan_type", "image")  # image, fs, repo
         target = params.get("target", "")
         output_format = params.get("output_format", "json")
@@ -11263,7 +11335,7 @@ def trivy():
 def scout_suite():
     """Execute Scout Suite for multi-cloud security assessment"""
     try:
-        params = request.json
+        params = _json_params()
         provider = params.get("provider", "aws")  # aws, azure, gcp, aliyun, oci
         profile = params.get("profile", "default")
         report_dir = params.get("report_dir", "/tmp/scout-suite")
@@ -11303,7 +11375,7 @@ def scout_suite():
 def cloudmapper():
     """Execute CloudMapper for AWS network visualization and security analysis"""
     try:
-        params = request.json
+        params = _json_params()
         action = params.get("action", "collect")  # collect, prepare, webserver, find_admins, etc.
         account = params.get("account", "")
         config = params.get("config", "config.json")
@@ -11336,7 +11408,7 @@ def cloudmapper():
 def pacu():
     """Execute Pacu for AWS exploitation framework"""
     try:
-        params = request.json
+        params = _json_params()
         session_name = params.get("session_name", "hexstrike_session")
         modules = params.get("modules", "")
         data_services = params.get("data_services", "")
@@ -11388,7 +11460,7 @@ def pacu():
 def kube_hunter():
     """Execute kube-hunter for Kubernetes penetration testing"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         remote = params.get("remote", "")
         cidr = params.get("cidr", "")
@@ -11432,7 +11504,7 @@ def kube_hunter():
 def kube_bench():
     """Execute kube-bench for CIS Kubernetes benchmark checks"""
     try:
-        params = request.json
+        params = _json_params()
         targets = params.get("targets", "")  # master, node, etcd, policies
         version = params.get("version", "")
         config_dir = params.get("config_dir", "")
@@ -11468,7 +11540,7 @@ def kube_bench():
 def docker_bench_security():
     """Execute Docker Bench for Security for Docker security assessment"""
     try:
-        params = request.json
+        params = _json_params()
         checks = params.get("checks", "")  # Specific checks to run
         exclude = params.get("exclude", "")  # Checks to exclude
         output_file = params.get("output_file", "/tmp/docker-bench-results.json")
@@ -11501,7 +11573,7 @@ def docker_bench_security():
 def clair():
     """Execute Clair for container vulnerability analysis"""
     try:
-        params = request.json
+        params = _json_params()
         image = params.get("image", "")
         config = params.get("config", "/etc/clair/config.yaml")
         output_format = params.get("output_format", "json")
@@ -11535,7 +11607,7 @@ def clair():
 def falco():
     """Execute Falco for runtime security monitoring"""
     try:
-        params = request.json
+        params = _json_params()
         config_file = params.get("config_file", "/etc/falco/falco.yaml")
         rules_file = params.get("rules_file", "")
         output_format = params.get("output_format", "json")
@@ -11568,7 +11640,7 @@ def falco():
 def checkov():
     """Execute Checkov for infrastructure as code security scanning"""
     try:
-        params = request.json
+        params = _json_params()
         directory = params.get("directory", ".")
         framework = params.get("framework", "")  # terraform, cloudformation, kubernetes, etc.
         check = params.get("check", "")
@@ -11605,7 +11677,7 @@ def checkov():
 def terrascan():
     """Execute Terrascan for infrastructure as code security scanning"""
     try:
-        params = request.json
+        params = _json_params()
         scan_type = params.get("scan_type", "all")  # all, terraform, k8s, etc.
         iac_dir = params.get("iac_dir", ".")
         policy_type = params.get("policy_type", "")
@@ -11639,7 +11711,7 @@ def terrascan():
 def dirb():
     """Execute dirb with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         url = params.get("url", "")
         wordlist = params.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
         additional_args = params.get("additional_args", "")
@@ -11669,7 +11741,7 @@ def dirb():
 def nikto():
     """Execute nikto with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         additional_args = params.get("additional_args", "")
 
@@ -11679,15 +11751,24 @@ def nikto():
                 "error": "Target parameter is required"
             }), 400
 
-        command = f"nikto -h {target}"
+        try:
+            target = validate_url(target) if "://" in target else validate_target(target)
+        except ValueError as exc:
+            return jsonify({"error": f"Invalid target: {exc}"}), 400
 
+        argv = ["nikto", "-h", target]
         if additional_args:
-            command += f" {additional_args}"
+            try:
+                argv += _shell_split(additional_args)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
+        gr_params = dict(params)
+        gr_params["target"] = _host_of(target)
         logger.info(f"🔬 Starting Nikto scan: {target}")
-        result = execute_command(command)
+        result = execute_tool_command("nikto", argv, gr_params["target"], gr_params)
         logger.info(f"📊 Nikto scan completed for {target}")
-        return jsonify(result)
+        return _tool_response(result)
     except Exception as e:
         logger.error(f"💥 Error in nikto endpoint: {str(e)}")
         return jsonify({
@@ -11698,8 +11779,8 @@ def nikto():
 def sqlmap():
     """Execute sqlmap with enhanced logging"""
     try:
-        params = request.json
-        url = params.get("url", "")
+        params = _json_params()
+        url = params.get("url") or params.get("target", "")
         data = params.get("data", "")
         additional_args = params.get("additional_args", "")
 
@@ -11724,9 +11805,13 @@ def sqlmap():
                 return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
         logger.info(f"💉 Starting SQLMap scan: {url}")
-        result = execute_command(argv)
+        # Guarded path: sqlmap is DESTRUCTIVE tier — scope/tier/kill/rate
+        # gates and the audit log must apply (was a bare execute_command).
+        gr_params = dict(params)
+        gr_params["target"] = _host_of(url)
+        result = execute_tool_command("sqlmap", argv, gr_params["target"], gr_params)
         logger.info(f"📊 SQLMap scan completed for {url}")
-        return jsonify(result)
+        return _tool_response(result)
     except Exception as e:
         logger.error(f"💥 Error in sqlmap endpoint: {str(e)}")
         return jsonify({
@@ -11739,7 +11824,7 @@ def metasploit():
     import tempfile
     resource_file = None
     try:
-        params = request.json
+        params = _json_params()
         module = params.get("module", "")
         options = params.get("options", {})
 
@@ -11800,7 +11885,7 @@ def metasploit():
 def hydra():
     """Execute hydra with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         service = params.get("service", "")
         username = params.get("username", "")
@@ -11859,7 +11944,7 @@ def hydra():
 def john():
     """Execute john with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         hash_file = params.get("hash_file", "")
         wordlist = params.get("wordlist", "/usr/share/wordlists/rockyou.txt")
         format_type = params.get("format", "")
@@ -11898,7 +11983,7 @@ def john():
 def wpscan():
     """Execute wpscan with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         url = params.get("url", "")
         additional_args = params.get("additional_args", "")
 
@@ -11908,15 +11993,28 @@ def wpscan():
                 "error": "URL parameter is required"
             }), 400
 
-        command = f"wpscan --url {url}"
+        try:
+            url = validate_url(url)
+        except ValueError as exc:
+            return jsonify({"error": f"Invalid url: {exc}"}), 400
 
+        # wpscan phones home to wpscan.com for plugin/theme enumeration and
+        # tries a DB update unless told otherwise — without these flags a
+        # scan of an unreachable host hangs for many minutes (the synthetic
+        # lab hit its 90s client timeout before any output came back).
+        argv = ["wpscan", "--url", url, "--no-update", "--disable-tls-checks"]
         if additional_args:
-            command += f" {additional_args}"
+            try:
+                argv += _shell_split(additional_args)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
+        gr_params = dict(params)
+        gr_params["target"] = _host_of(url)
         logger.info(f"🔍 Starting WPScan: {url}")
-        result = execute_command(command)
+        result = execute_tool_command("wpscan", argv, gr_params["target"], gr_params)
         logger.info(f"📊 WPScan completed for {url}")
-        return jsonify(result)
+        return _tool_response(result)
     except Exception as e:
         logger.error(f"💥 Error in wpscan endpoint: {str(e)}")
         return jsonify({
@@ -11927,7 +12025,7 @@ def wpscan():
 def enum4linux():
     """Execute enum4linux with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         additional_args = params.get("additional_args", "-a")
 
@@ -11953,7 +12051,7 @@ def enum4linux():
 def ffuf():
     """Execute FFuf web fuzzer with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         url = params.get("url", "")
         wordlist = params.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
         mode = params.get("mode", "directory")
@@ -11996,7 +12094,7 @@ def ffuf():
 def netexec():
     """Execute NetExec (formerly CrackMapExec) with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         protocol = params.get("protocol", "smb")
         username = params.get("username", "")
@@ -12053,7 +12151,7 @@ def netexec():
 def amass():
     """Execute Amass for subdomain enumeration with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         domain = params.get("domain", "")
         mode = params.get("mode", "enum")
         additional_args = params.get("additional_args", "")
@@ -12088,7 +12186,7 @@ def amass():
 def hashcat():
     """Execute Hashcat for password cracking with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         hash_file = params.get("hash_file", "")
         hash_type = params.get("hash_type", "")
         attack_mode = params.get("attack_mode", "0")
@@ -12132,7 +12230,7 @@ def hashcat():
 def subfinder():
     """Execute Subfinder for passive subdomain enumeration with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         domain = params.get("domain", "")
         silent = params.get("silent", True)
         all_sources = params.get("all_sources", False)
@@ -12169,7 +12267,7 @@ def subfinder():
 def smbmap():
     """Execute SMBMap for SMB share enumeration with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         username = params.get("username", "")
         password = params.get("password", "")
@@ -12214,7 +12312,7 @@ def smbmap():
 def rustscan():
     """Execute Rustscan for ultra-fast port scanning with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         ports = params.get("ports", "")
         ulimit = params.get("ulimit", 5000)
@@ -12250,7 +12348,7 @@ def rustscan():
 def masscan():
     """Execute Masscan for high-speed Internet-scale port scanning with intelligent rate limiting"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         ports = params.get("ports", "1-65535")
         rate = params.get("rate", 1000)
@@ -12345,14 +12443,21 @@ def build_nmap_advanced_command(params: Dict[str, Any]) -> tuple:
         argv += ["-sV"]
     if params.get("aggressive"):
         argv += ["-A"]
+    # Broadcast/discovery/external NSE scripts are never target-scoped: they
+    # shout into L2 broadcast, query third-party services (OPSEC leak) and
+    # sniff neighbour traffic regardless of the scanned host (synthetic lab
+    # saw targets-asn and the whole broadcast/* family run "pre-scan" against
+    # an unrelated network). Excluded from every script expression.
+    # NOTE: nmap has no --script-exclude flag, the comma is OR (so a plain
+    # "default,safe,not broadcast" matches everything), parentheses are NOT
+    # supported and `safe` alone still contains discovery/external scripts —
+    # hence the chained AND-NOT (verified against nmap 7.99).
+    _excl = " and not broadcast and not discovery and not external"
     if nse_scripts:
-        argv += [f"--script={nse_scripts}"]
+        argv += [f"--script={nse_scripts}{_excl}"]
     elif not params.get("aggressive"):
         # target-scoped script set only — see docstring (BUG-2)
-        argv += ["--script=default,safe"]
-    # broadcast NSE scripts are never target-scoped; keep them out even when
-    # the caller passes a custom --script list
-    argv += ["--script-exclude=broadcast"]
+        argv += [f"--script=default,safe{_excl}"]
     # one stuck NSE script must not eat the whole command budget
     argv += ["--host-timeout=2m", "--script-timeout=30s"]
     argv += _shell_split(additional_args)
@@ -12384,7 +12489,7 @@ def nmap_advanced():
         logger.info(f"🔍 Starting Advanced Nmap: {target}")
         result = execute_tool_command("nmap-advanced", argv, target, params)
         logger.info(f"📊 Advanced Nmap completed for {target}")
-        return jsonify(result)
+        return _tool_response(result)
     except Exception as e:
         logger.error(f"💥 Error in advanced nmap endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -12393,7 +12498,7 @@ def nmap_advanced():
 def autorecon():
     """Execute AutoRecon for comprehensive automated reconnaissance"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         output_dir = params.get("output_dir", "/tmp/autorecon")
         port_scans = params.get("port_scans", "top-100-ports")
@@ -12406,21 +12511,30 @@ def autorecon():
             logger.warning("🎯 AutoRecon called without target parameter")
             return jsonify({"error": "Target parameter is required"}), 400
 
-        command = f"autorecon {target} -o {output_dir} --heartbeat {heartbeat} --timeout {timeout}"
+        try:
+            target = validate_target(target)
+            output_dir = _validate_fs_path(output_dir, "output_dir")
+            for name, val in (("heartbeat", heartbeat), ("timeout", timeout)):
+                int(val)
+        except (ValueError, TypeError) as exc:
+            return jsonify({"error": f"Invalid parameter: {exc}"}), 400
 
+        argv = ["autorecon", target, "-o", output_dir,
+                "--heartbeat", str(heartbeat), "--timeout", str(timeout)]
         if port_scans != "default":
-            command += f" --port-scans {port_scans}"
-
+            argv += ["--port-scans", str(port_scans)]
         if service_scans != "default":
-            command += f" --service-scans {service_scans}"
-
+            argv += ["--service-scans", str(service_scans)]
         if additional_args:
-            command += f" {additional_args}"
+            try:
+                argv += _shell_split(additional_args)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
         logger.info(f"🔄 Starting AutoRecon: {target}")
-        result = execute_command(command)
+        result = execute_tool_command("autorecon", argv, target, params)
         logger.info(f"📊 AutoRecon completed for {target}")
-        return jsonify(result)
+        return _tool_response(result)
     except Exception as e:
         logger.error(f"💥 Error in autorecon endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -12429,7 +12543,7 @@ def autorecon():
 def enum4linux_ng():
     """Execute Enum4linux-ng for advanced SMB enumeration with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         username = params.get("username", "")
         password = params.get("password", "")
@@ -12444,16 +12558,18 @@ def enum4linux_ng():
             logger.warning("🎯 Enum4linux-ng called without target parameter")
             return jsonify({"error": "Target parameter is required"}), 400
 
-        command = f"enum4linux-ng {target}"
+        try:
+            target = validate_target(target)
+        except ValueError as exc:
+            return jsonify({"error": f"Invalid target: {exc}"}), 400
 
+        argv = ["enum4linux-ng", target]
         if username:
-            command += f" -u {username}"
-
+            argv += ["-u", str(username)]
         if password:
-            command += f" -p {password}"
-
+            argv += ["-p", str(password)]
         if domain:
-            command += f" -d {domain}"
+            argv += ["-d", str(domain)]
 
         # Add specific enumeration options
         enum_options = []
@@ -12467,15 +12583,18 @@ def enum4linux_ng():
             enum_options.append("P")
 
         if enum_options:
-            command += f" -A {','.join(enum_options)}"
+            argv += ["-A", ",".join(enum_options)]
 
         if additional_args:
-            command += f" {additional_args}"
+            try:
+                argv += _shell_split(additional_args)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
         logger.info(f"🔍 Starting Enum4linux-ng: {target}")
-        result = execute_command(command)
+        result = execute_tool_command("enum4linux-ng", argv, target, params)
         logger.info(f"📊 Enum4linux-ng completed for {target}")
-        return jsonify(result)
+        return _tool_response(result)
     except Exception as e:
         logger.error(f"💥 Error in enum4linux-ng endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -12484,7 +12603,7 @@ def enum4linux_ng():
 def rpcclient():
     """Execute rpcclient for RPC enumeration with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         username = params.get("username", "")
         password = params.get("password", "")
@@ -12528,7 +12647,7 @@ def rpcclient():
 def nbtscan():
     """Execute nbtscan for NetBIOS name scanning with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         verbose = params.get("verbose", False)
         timeout = params.get("timeout", 2)
@@ -12560,7 +12679,7 @@ def nbtscan():
 def arp_scan():
     """Execute arp-scan for network discovery with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         interface = params.get("interface", "")
         local_network = params.get("local_network", False)
@@ -12597,7 +12716,7 @@ def arp_scan():
 def responder():
     """Execute Responder for credential harvesting with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         interface = params.get("interface", "eth0")
         analyze = params.get("analyze", False)
         wpad = params.get("wpad", True)
@@ -12639,7 +12758,7 @@ def responder():
 def volatility():
     """Execute Volatility for memory forensics with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         memory_file = params.get("memory_file", "")
         plugin = params.get("plugin", "")
         profile = params.get("profile", "")
@@ -12681,7 +12800,7 @@ def volatility():
 def msfvenom():
     """Execute MSFVenom to generate payloads with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         payload = params.get("payload", "")
         format_type = params.get("format", "")
         output_file = params.get("output_file", "")
@@ -12730,7 +12849,7 @@ def msfvenom():
 def gdb():
     """Execute GDB for binary analysis and debugging with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         binary = params.get("binary", "")
         commands = params.get("commands", "")
         script_file = params.get("script_file", "")
@@ -12742,33 +12861,45 @@ def gdb():
                 "error": "Binary parameter is required"
             }), 400
 
-        command = f"gdb {binary}"
+        try:
+            binary = _validate_fs_path(binary, "binary")
+            if script_file:
+                script_file = _validate_fs_path(script_file, "script_file")
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
 
-        if script_file:
-            command += f" -x {script_file}"
+        temp_script = None
+        argv = ["gdb", binary]
+        try:
+            if script_file:
+                argv += ["-x", script_file]
 
-        if commands:
-            temp_script = "/tmp/gdb_commands.txt"
-            with open(temp_script, "w") as f:
-                f.write(commands)
-            command += f" -x {temp_script}"
+            if commands:
+                # mkstemp: predictable /tmp/gdb_commands.txt was a symlink
+                # attack target and collided between concurrent requests
+                fd, temp_script = tempfile.mkstemp(prefix="hxs_gdb_", suffix=".gdb")
+                with os.fdopen(fd, "w") as f:
+                    f.write(str(commands))
+                argv += ["-x", temp_script]
 
-        if additional_args:
-            command += f" {additional_args}"
+            if additional_args:
+                try:
+                    argv += _shell_split(additional_args)
+                except ValueError as exc:
+                    return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
-        command += " -batch"
+            argv.append("-batch")
 
-        logger.info(f"🔧 Starting GDB analysis: {binary}")
-        result = execute_command(command)
-
-        if commands and os.path.exists("/tmp/gdb_commands.txt"):
-            try:
-                os.remove("/tmp/gdb_commands.txt")
-            except:
-                pass
-
-        logger.info(f"📊 GDB analysis completed for {binary}")
-        return jsonify(result)
+            logger.info(f"🔧 Starting GDB analysis: {binary}")
+            result = execute_tool_command("gdb", argv, None, params)
+            logger.info(f"📊 GDB analysis completed for {binary}")
+            return _tool_response(result)
+        finally:
+            if temp_script and os.path.exists(temp_script):
+                try:
+                    os.remove(temp_script)
+                except OSError:
+                    pass
     except Exception as e:
         logger.error(f"💥 Error in gdb endpoint: {str(e)}")
         return jsonify({
@@ -12779,7 +12910,7 @@ def gdb():
 def radare2():
     """Execute Radare2 for binary analysis and reverse engineering with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         binary = params.get("binary", "")
         commands = params.get("commands", "")
         additional_args = params.get("additional_args", "")
@@ -12790,28 +12921,37 @@ def radare2():
                 "error": "Binary parameter is required"
             }), 400
 
-        if commands:
-            temp_script = "/tmp/r2_commands.txt"
-            with open(temp_script, "w") as f:
-                f.write(commands)
-            command = f"r2 -i {temp_script} -q {binary}"
-        else:
-            command = f"r2 -q {binary}"
+        try:
+            binary = _validate_fs_path(binary, "binary")
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
 
-        if additional_args:
-            command += f" {additional_args}"
+        temp_script = None
+        try:
+            if commands:
+                fd, temp_script = tempfile.mkstemp(prefix="hxs_r2_", suffix=".r2")
+                with os.fdopen(fd, "w") as f:
+                    f.write(str(commands))
+                argv = ["r2", "-i", temp_script, "-q", binary]
+            else:
+                argv = ["r2", "-q", binary]
 
-        logger.info(f"🔧 Starting Radare2 analysis: {binary}")
-        result = execute_command(command)
+            if additional_args:
+                try:
+                    argv += _shell_split(additional_args)
+                except ValueError as exc:
+                    return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
-        if commands and os.path.exists("/tmp/r2_commands.txt"):
-            try:
-                os.remove("/tmp/r2_commands.txt")
-            except:
-                pass
-
-        logger.info(f"📊 Radare2 analysis completed for {binary}")
-        return jsonify(result)
+            logger.info(f"🔧 Starting Radare2 analysis: {binary}")
+            result = execute_tool_command("radare2", argv, None, params)
+            logger.info(f"📊 Radare2 analysis completed for {binary}")
+            return _tool_response(result)
+        finally:
+            if temp_script and os.path.exists(temp_script):
+                try:
+                    os.remove(temp_script)
+                except OSError:
+                    pass
     except Exception as e:
         logger.error(f"💥 Error in radare2 endpoint: {str(e)}")
         return jsonify({
@@ -12822,7 +12962,7 @@ def radare2():
 def binwalk():
     """Execute Binwalk for firmware and file analysis with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         file_path = params.get("file_path", "")
         extract = params.get("extract", False)
         additional_args = params.get("additional_args", "")
@@ -12857,7 +12997,7 @@ def binwalk():
 def ropgadget():
     """Search for ROP gadgets in a binary using ROPgadget with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         binary = params.get("binary", "")
         gadget_type = params.get("gadget_type", "")
         additional_args = params.get("additional_args", "")
@@ -12890,7 +13030,7 @@ def ropgadget():
 def checksec():
     """Check security features of a binary with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         binary = params.get("binary", "")
 
         if not binary:
@@ -12915,7 +13055,7 @@ def checksec():
 def xxd():
     """Create a hex dump of a file using xxd with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         file_path = params.get("file_path", "")
         offset = params.get("offset", "0")
         length = params.get("length", "")
@@ -12951,7 +13091,7 @@ def xxd():
 def strings():
     """Extract strings from a binary file with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         file_path = params.get("file_path", "")
         min_len = params.get("min_len", 4)
         additional_args = params.get("additional_args", "")
@@ -12983,7 +13123,7 @@ def strings():
 def objdump():
     """Analyze a binary using objdump with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         binary = params.get("binary", "")
         disassemble = params.get("disassemble", True)
         additional_args = params.get("additional_args", "")
@@ -13024,7 +13164,7 @@ def objdump():
 def ghidra():
     """Execute Ghidra for advanced binary analysis and reverse engineering"""
     try:
-        params = request.json
+        params = _json_params()
         binary = params.get("binary", "")
         project_name = params.get("project_name", "hexstrike_analysis")
         script_file = params.get("script_file", "")
@@ -13064,7 +13204,7 @@ def ghidra():
 def pwntools():
     """Execute Pwntools for exploit development and automation"""
     try:
-        params = request.json
+        params = _json_params()
         script_content = params.get("script_content", "")
         target_binary = params.get("target_binary", "")
         target_host = params.get("target_host", "")
@@ -13139,7 +13279,7 @@ p.interactive()
 def one_gadget():
     """Execute one_gadget to find one-shot RCE gadgets in libc"""
     try:
-        params = request.json
+        params = _json_params()
         libc_path = params.get("libc_path", "")
         level = params.get("level", 1)  # 0, 1, 2 for different constraint levels
         additional_args = params.get("additional_args", "")
@@ -13165,7 +13305,7 @@ def one_gadget():
 def libc_database():
     """Execute libc-database for libc identification and offset lookup"""
     try:
-        params = request.json
+        params = _json_params()
         action = params.get("action", "find")  # find, dump, download
         symbols = params.get("symbols", "")  # format: "symbol1:offset1 symbol2:offset2"
         libc_id = params.get("libc_id", "")
@@ -13206,7 +13346,7 @@ def libc_database():
 def gdb_peda():
     """Execute GDB with PEDA for enhanced debugging and exploitation"""
     try:
-        params = request.json
+        params = _json_params()
         binary = params.get("binary", "")
         commands = params.get("commands", "")
         attach_pid = params.get("attach_pid", 0)
@@ -13268,7 +13408,7 @@ quit
 def angr():
     """Execute angr for symbolic execution and binary analysis"""
     try:
-        params = request.json
+        params = _json_params()
         binary = params.get("binary", "")
         script_content = params.get("script_content", "")
         find_address = params.get("find_address", "")
@@ -13359,7 +13499,7 @@ for func_addr, func in cfg.functions.items():
 def ropper():
     """Execute ropper for advanced ROP/JOP gadget searching"""
     try:
-        params = request.json
+        params = _json_params()
         binary = params.get("binary", "")
         gadget_type = params.get("gadget_type", "rop")  # rop, jop, sys, all
         quality = params.get("quality", 1)  # 1-5, higher = better quality
@@ -13406,7 +13546,7 @@ def ropper():
 def pwninit():
     """Execute pwninit for CTF binary exploitation setup"""
     try:
-        params = request.json
+        params = _json_params()
         binary = params.get("binary", "")
         libc = params.get("libc", "")
         ld = params.get("ld", "")
@@ -13447,7 +13587,7 @@ def pwninit():
 def feroxbuster():
     """Execute Feroxbuster for recursive content discovery with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         url = params.get("url", "")
         wordlist = params.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
         threads = params.get("threads", 10)
@@ -13478,7 +13618,7 @@ def feroxbuster():
 def dotdotpwn():
     """Execute DotDotPwn for directory traversal testing with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         module = params.get("module", "http")
         additional_args = params.get("additional_args", "")
@@ -13510,7 +13650,7 @@ def dotdotpwn():
 def xsser():
     """Execute XSSer for XSS vulnerability testing with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         url = params.get("url", "")
         params_str = params.get("params", "")
         additional_args = params.get("additional_args", "")
@@ -13543,7 +13683,7 @@ def xsser():
 def wfuzz():
     """Execute Wfuzz for web application fuzzing with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         url = params.get("url", "")
         wordlist = params.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
         additional_args = params.get("additional_args", "")
@@ -13577,7 +13717,7 @@ def wfuzz():
 def dirsearch():
     """Execute Dirsearch for advanced directory and file discovery with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         url = params.get("url", "")
         extensions = params.get("extensions", "php,html,js,txt,xml,json")
         wordlist = params.get("wordlist", "/usr/share/wordlists/dirsearch/common.txt")
@@ -13589,27 +13729,88 @@ def dirsearch():
             logger.warning("🌐 Dirsearch called without URL parameter")
             return jsonify({"error": "URL parameter is required"}), 400
 
-        command = f"dirsearch -u {url} -e {extensions} -w {wordlist} -t {threads}"
+        try:
+            url = validate_url(url)
+            wordlist = _validate_fs_path(wordlist, "wordlist")
+        except ValueError as exc:
+            return jsonify({"error": f"Invalid parameter: {exc}"}), 400
+        try:
+            threads = max(1, min(int(threads), 100))
+        except (TypeError, ValueError):
+            threads = 30
 
+        # dirsearch insists on creating a relative reports/ folder in its
+        # CWD (Kali build does this even when -o is given) — the service CWD
+        # is not writable, so every scan died with "Couldn't create report
+        # folder". Run it inside a temp working directory and put the report
+        # there too.
+        workdir = tempfile.mkdtemp(prefix="hxs_dirsearch_wd_")
+        report_file = os.path.join(workdir, "report.txt")
+
+        argv = ["dirsearch", "-u", url, "-e", extensions, "-w", wordlist,
+                "-t", str(threads), "-o", report_file]
         if recursive:
-            command += " -r"
-
+            argv.append("-r")
         if additional_args:
-            command += f" {additional_args}"
+            try:
+                argv += _shell_split(additional_args)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
+        gr_params = dict(params)
+        gr_params["target"] = _host_of(url)
         logger.info(f"📁 Starting Dirsearch scan: {url}")
-        result = execute_command(command)
+        result = execute_tool_command("dirsearch", argv, gr_params["target"],
+                                      gr_params, cwd=workdir)
+        result["report_file"] = report_file
+        result["workdir"] = workdir
         logger.info(f"📊 Dirsearch scan completed for {url}")
-        return jsonify(result)
+        return _tool_response(result)
     except Exception as e:
         logger.error(f"💥 Error in dirsearch endpoint: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+@app.route("/api/tools/whatweb", methods=["POST"])
+def whatweb():
+    """Execute WhatWeb for technology fingerprinting.
+
+    Route was missing entirely: the health panel and decision-engine
+    workflows referenced `whatweb` but there was no /api/tools/whatweb —
+    any REST/MCP attempt 404'd (found by the synthetic lab).
+    """
+    try:
+        params = _json_params()
+        target = params.get("target") or params.get("url", "")
+        additional_args = params.get("additional_args", "")
+
+        if not target:
+            return jsonify({"error": "Target parameter is required"}), 400
+        try:
+            target = validate_url(target) if "://" in target else validate_target(target)
+        except ValueError as exc:
+            return jsonify({"error": f"Invalid target: {exc}"}), 400
+
+        argv = ["whatweb", target]
+        if additional_args:
+            try:
+                argv += _shell_split(additional_args)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
+
+        gr_params = dict(params)
+        gr_params["target"] = _host_of(target)
+        logger.info(f"🌐 Starting WhatWeb fingerprint: {target}")
+        result = execute_tool_command("whatweb", argv, gr_params["target"], gr_params)
+        return _tool_response(result)
+    except Exception as e:
+        logger.error(f"💥 Error in whatweb endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 @app.route("/api/tools/katana", methods=["POST"])
 def katana():
     """Execute Katana for next-generation crawling and spidering with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         url = params.get("url", "")
         depth = params.get("depth", 3)
         js_crawl = params.get("js_crawl", True)
@@ -13647,7 +13848,7 @@ def katana():
 def gau():
     """Execute Gau (Get All URLs) for URL discovery from multiple sources with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         domain = params.get("domain", "")
         providers = params.get("providers", "wayback,commoncrawl,otx,urlscan")
         include_subs = params.get("include_subs", True)
@@ -13684,7 +13885,7 @@ def gau():
 def waybackurls():
     """Execute Waybackurls for historical URL discovery with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         domain = params.get("domain", "")
         get_versions = params.get("get_versions", False)
         no_subs = params.get("no_subs", False)
@@ -13717,7 +13918,7 @@ def waybackurls():
 def arjun():
     """Execute Arjun for HTTP parameter discovery with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         url = params.get("url", "")
         method = params.get("method", "GET")
         wordlist = params.get("wordlist", "")
@@ -13756,7 +13957,7 @@ def arjun():
 def paramspider():
     """Execute ParamSpider for parameter mining from web archives with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         domain = params.get("domain", "")
         level = params.get("level", 2)
         exclude = params.get("exclude", "png,jpg,gif,jpeg,swf,woff,svg,pdf,css,ico")
@@ -13790,7 +13991,7 @@ def paramspider():
 def x8():
     """Execute x8 for hidden parameter discovery with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         url = params.get("url", "")
         wordlist = params.get("wordlist", "/usr/share/wordlists/x8/params.txt")
         method = params.get("method", "GET")
@@ -13825,7 +14026,7 @@ def x8():
 def jaeles():
     """Execute Jaeles for advanced vulnerability scanning with custom signatures"""
     try:
-        params = request.json
+        params = _json_params()
         url = params.get("url", "")
         signatures = params.get("signatures", "")
         config = params.get("config", "")
@@ -13860,7 +14061,7 @@ def jaeles():
 def dalfox():
     """Execute Dalfox for advanced XSS vulnerability scanning with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         url = params.get("url", "")
         pipe_mode = params.get("pipe_mode", False)
         blind = params.get("blind", False)
@@ -13873,30 +14074,35 @@ def dalfox():
             logger.warning("🌐 Dalfox called without URL parameter")
             return jsonify({"error": "URL parameter is required"}), 400
 
-        if pipe_mode:
-            command = "dalfox pipe"
-        else:
-            command = f"dalfox url {url}"
+        if url:
+            try:
+                url = validate_url(url)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid url: {exc}"}), 400
 
+        # argv-form (shell=False): every token below is literal, injection
+        # via url/custom_payload/additional_args is neutralised
+        argv = ["dalfox", "pipe"] if pipe_mode else ["dalfox", "url", url]
         if blind:
-            command += " --blind"
-
+            argv.append("--blind")
         if mining_dom:
-            command += " --mining-dom"
-
+            argv.append("--mining-dom")
         if mining_dict:
-            command += " --mining-dict"
-
+            argv.append("--mining-dict")
         if custom_payload:
-            command += f" --custom-payload '{custom_payload}'"
-
+            argv += ["--custom-payload", str(custom_payload)]
         if additional_args:
-            command += f" {additional_args}"
+            try:
+                argv += _shell_split(additional_args)
+            except ValueError as exc:
+                return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
+        gr_params = dict(params)
+        gr_params["target"] = _host_of(url) if url else None
         logger.info(f"🎯 Starting Dalfox XSS scan: {url if url else 'pipe mode'}")
-        result = execute_command(command)
+        result = execute_tool_command("dalfox", argv, gr_params["target"], gr_params)
         logger.info(f"📊 Dalfox XSS scan completed")
-        return jsonify(result)
+        return _tool_response(result)
     except Exception as e:
         logger.error(f"💥 Error in dalfox endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
@@ -14073,7 +14279,7 @@ def httpx():
 def anew():
     """Execute anew for appending new lines to files (useful for data processing)"""
     try:
-        params = request.json
+        params = _json_params()
         input_data = params.get("input_data", "")
         output_file = params.get("output_file", "")
         additional_args = params.get("additional_args", "")
@@ -14102,7 +14308,7 @@ def anew():
 def qsreplace():
     """Execute qsreplace for query string parameter replacement"""
     try:
-        params = request.json
+        params = _json_params()
         urls = params.get("urls", "")
         replacement = params.get("replacement", "FUZZ")
         additional_args = params.get("additional_args", "")
@@ -14128,7 +14334,7 @@ def qsreplace():
 def uro():
     """Execute uro for filtering out similar URLs"""
     try:
-        params = request.json
+        params = _json_params()
         urls = params.get("urls", "")
         whitelist = params.get("whitelist", "")
         blacklist = params.get("blacklist", "")
@@ -14927,7 +15133,7 @@ browser_agent = BrowserAgent()
 def http_framework_endpoint():
     """Enhanced HTTP testing framework (Burp Suite alternative)"""
     try:
-        params = request.json
+        params = _json_params()
         action = params.get("action", "request")  # request, spider, proxy_history, set_rules, set_scope, repeater, intruder
         url = params.get("url", "")
         method = params.get("method", "GET")
@@ -15112,7 +15318,7 @@ def browser_agent_endpoint():
 def burpsuite_alternative():
     """Comprehensive Burp Suite alternative combining HTTP framework and browser agent"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         scan_type = params.get("scan_type", "comprehensive")  # comprehensive, spider, passive, active
         headless = params.get("headless", True)
@@ -15206,7 +15412,7 @@ def burpsuite_alternative():
 def zap():
     """Execute OWASP ZAP with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         scan_type = params.get("scan_type", "baseline")
         api_key = params.get("api_key", "")
@@ -15256,7 +15462,7 @@ def zap():
 def wafw00f():
     """Execute wafw00f to identify and fingerprint WAF products with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         target = params.get("target", "")
         additional_args = params.get("additional_args", "")
 
@@ -15285,7 +15491,7 @@ def wafw00f():
 def fierce():
     """Execute fierce for DNS reconnaissance with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         domain = params.get("domain", "")
         dns_server = params.get("dns_server", "")
         additional_args = params.get("additional_args", "")
@@ -15318,7 +15524,7 @@ def fierce():
 def dnsenum():
     """Execute dnsenum for DNS enumeration with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         domain = params.get("domain", "")
         dns_server = params.get("dns_server", "")
         wordlist = params.get("wordlist", "")
@@ -15356,7 +15562,7 @@ def dnsenum():
 def install_python_package():
     """Install a Python package in a virtual environment"""
     try:
-        params = request.json
+        params = _json_params()
         package = params.get("package", "")
         env_name = params.get("env_name", "default")
 
@@ -15386,7 +15592,7 @@ def install_python_package():
 def execute_python_script():
     """Execute a Python script in a virtual environment"""
     try:
-        params = request.json
+        params = _json_params()
         script = params.get("script", "")
         env_name = params.get("env_name", "default")
         filename = params.get("filename", f"script_{int(time.time())}.py")
@@ -15637,7 +15843,7 @@ ai_payload_generator = AIPayloadGenerator()
 def ai_generate_payload():
     """Generate AI-powered contextual payloads for security testing"""
     try:
-        params = request.json
+        params = _json_params()
         target_info = {
             "attack_type": params.get("attack_type", "xss"),
             "complexity": params.get("complexity", "basic"),
@@ -15667,7 +15873,7 @@ def ai_generate_payload():
 def ai_test_payload():
     """Test generated payload against target with AI analysis"""
     try:
-        params = request.json
+        params = _json_params()
         payload = params.get("payload", "")
         target_url = params.get("target_url", "")
         method = params.get("method", "GET")
@@ -15729,7 +15935,7 @@ def ai_test_payload():
 def api_fuzzer():
     """Advanced API endpoint fuzzing with intelligent parameter discovery"""
     try:
-        params = request.json
+        params = _json_params()
         base_url = params.get("base_url", "")
         endpoints = params.get("endpoints", [])
         methods = params.get("methods", ["GET", "POST", "PUT", "DELETE"])
@@ -15786,7 +15992,7 @@ def api_fuzzer():
 def graphql_scanner():
     """Advanced GraphQL security scanning and introspection"""
     try:
-        params = request.json
+        params = _json_params()
         endpoint = params.get("endpoint", "")
         introspection = params.get("introspection", True)
         query_depth = params.get("query_depth", 10)
@@ -15893,7 +16099,7 @@ def graphql_scanner():
 def jwt_analyzer():
     """Advanced JWT token analysis and vulnerability testing"""
     try:
-        params = request.json
+        params = _json_params()
         jwt_token = params.get("jwt_token", "")
         target_url = params.get("target_url", "")
 
@@ -16011,7 +16217,7 @@ def jwt_analyzer():
 def api_schema_analyzer():
     """Analyze API schemas and identify potential security issues"""
     try:
-        params = request.json
+        params = _json_params()
         schema_url = params.get("schema_url", "")
         schema_type = params.get("schema_type", "openapi")  # openapi, swagger, graphql
 
@@ -16123,7 +16329,7 @@ def api_schema_analyzer():
 def volatility3():
     """Execute Volatility3 for advanced memory forensics with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         memory_file = params.get("memory_file", "")
         plugin = params.get("plugin", "")
         output_file = params.get("output_file", "")
@@ -16163,7 +16369,7 @@ def volatility3():
 def foremost():
     """Execute Foremost for file carving with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         input_file = params.get("input_file", "")
         output_dir = params.get("output_dir", "/tmp/foremost_output")
         file_types = params.get("file_types", "")
@@ -16203,7 +16409,7 @@ def foremost():
 def steghide():
     """Execute Steghide for steganography analysis with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         action = params.get("action", "extract")  # extract, embed, info
         cover_file = params.get("cover_file", "")
         embed_file = params.get("embed_file", "")
@@ -16252,7 +16458,7 @@ def steghide():
 def exiftool():
     """Execute ExifTool for metadata extraction with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         file_path = params.get("file_path", "")
         output_format = params.get("output_format", "")  # json, xml, csv
         tags = params.get("tags", "")
@@ -16291,7 +16497,7 @@ def exiftool():
 def hashpump():
     """Execute HashPump for hash length extension attacks with enhanced logging"""
     try:
-        params = request.json
+        params = _json_params()
         signature = params.get("signature", "")
         data = params.get("data", "")
         key_length = params.get("key_length", "")
@@ -16337,7 +16543,7 @@ def hakrawler():
     - -subs for subdomain inclusion
     """
     try:
-        params = request.json
+        params = _json_params()
         url = params.get("url", "")
         depth = params.get("depth", 2)
         forms = params.get("forms", True)
@@ -16384,7 +16590,7 @@ def hakrawler():
 def cve_monitor():
     """Monitor CVE databases for new vulnerabilities with AI analysis"""
     try:
-        params = request.json
+        params = _json_params()
         hours = params.get("hours", 24)
         severity_filter = params.get("severity_filter", "HIGH,CRITICAL")
         keywords = params.get("keywords", "")
@@ -16438,7 +16644,7 @@ def cve_monitor():
 def exploit_generate():
     """Generate exploits from vulnerability data using AI"""
     try:
-        params = request.json
+        params = _json_params()
         cve_id = params.get("cve_id", "")
         target_os = params.get("target_os", "")
         target_arch = params.get("target_arch", "x64")
@@ -16511,7 +16717,7 @@ def exploit_generate():
 def discover_attack_chains():
     """Discover multi-stage attack possibilities"""
     try:
-        params = request.json
+        params = _json_params()
         target_software = params.get("target_software", "")
         attack_depth = params.get("attack_depth", 3)
         include_zero_days = params.get("include_zero_days", False)
@@ -16588,7 +16794,7 @@ def discover_attack_chains():
 def threat_intelligence_feeds():
     """Aggregate and correlate threat intelligence from multiple sources"""
     try:
-        params = request.json
+        params = _json_params()
         indicators = params.get("indicators", [])
         timeframe = params.get("timeframe", "30d")
         sources = params.get("sources", "all")
@@ -16723,7 +16929,7 @@ def threat_intelligence_feeds():
 def zero_day_research():
     """Automated zero-day vulnerability research using AI analysis"""
     try:
-        params = request.json
+        params = _json_params()
         target_software = params.get("target_software", "")
         analysis_depth = params.get("analysis_depth", "standard")
         source_code_url = params.get("source_code_url", "")
@@ -16862,7 +17068,7 @@ def zero_day_research():
 def advanced_payload_generation():
     """Generate advanced payloads with AI-powered evasion techniques"""
     try:
-        params = request.json
+        params = _json_params()
         attack_type = params.get("attack_type", "rce")
         target_context = params.get("target_context", "")
         evasion_level = params.get("evasion_level", "standard")
@@ -17004,7 +17210,7 @@ def advanced_payload_generation():
 def create_ctf_challenge_workflow():
     """Create specialized workflow for CTF challenge"""
     try:
-        params = request.json
+        params = _json_params()
         challenge_name = params.get("name", "")
         category = params.get("category", "misc")
         difficulty = params.get("difficulty", "unknown")
@@ -17044,7 +17250,7 @@ def create_ctf_challenge_workflow():
 def auto_solve_ctf_challenge():
     """Attempt to automatically solve a CTF challenge"""
     try:
-        params = request.json
+        params = _json_params()
         challenge_name = params.get("name", "")
         category = params.get("category", "misc")
         difficulty = params.get("difficulty", "unknown")
@@ -17084,7 +17290,7 @@ def auto_solve_ctf_challenge():
 def create_ctf_team_strategy():
     """Create optimal team strategy for CTF competition"""
     try:
-        params = request.json
+        params = _json_params()
         challenges_data = params.get("challenges", [])
         team_skills = params.get("team_skills", {})
 
@@ -17124,7 +17330,7 @@ def create_ctf_team_strategy():
 def suggest_ctf_tools():
     """Suggest optimal tools for CTF challenge based on description and category"""
     try:
-        params = request.json
+        params = _json_params()
         description = params.get("description", "")
         category = params.get("category", "misc")
 
@@ -17161,7 +17367,7 @@ def suggest_ctf_tools():
 def ctf_cryptography_solver():
     """Advanced cryptography challenge solver with multiple attack methods"""
     try:
-        params = request.json
+        params = _json_params()
         cipher_text = params.get("cipher_text", "")
         cipher_type = params.get("cipher_type", "unknown")
         key_hint = params.get("key_hint", "")
@@ -17259,7 +17465,7 @@ def ctf_cryptography_solver():
 def ctf_forensics_analyzer():
     """Advanced forensics challenge analyzer with multiple investigation techniques"""
     try:
-        params = request.json
+        params = _json_params()
         file_path = params.get("file_path", "")
         analysis_type = params.get("analysis_type", "comprehensive")
         extract_hidden = params.get("extract_hidden", True)
@@ -17402,7 +17608,7 @@ def ctf_forensics_analyzer():
 def ctf_binary_analyzer():
     """Advanced binary analysis for reverse engineering and pwn challenges"""
     try:
-        params = request.json
+        params = _json_params()
         binary_path = params.get("binary_path", "")
         analysis_depth = params.get("analysis_depth", "comprehensive")  # basic, comprehensive, deep
         check_protections = params.get("check_protections", True)
@@ -17582,7 +17788,7 @@ def ctf_binary_analyzer():
 def execute_command_async():
     """Execute command asynchronously using enhanced process management"""
     try:
-        params = request.json
+        params = _json_params()
         command = params.get("command", "")
         context = params.get("context", {})
 
@@ -17762,7 +17968,7 @@ def terminate_process_gracefully(pid):
 def configure_auto_scaling():
     """Configure auto-scaling settings"""
     try:
-        params = request.json
+        params = _json_params()
         enabled = params.get("enabled", True)
         thresholds = params.get("thresholds", {})
 
@@ -17788,7 +17994,7 @@ def configure_auto_scaling():
 def manual_scale_pool():
     """Manually scale the process pool"""
     try:
-        params = request.json
+        params = _json_params()
         action = params.get("action", "")  # "up" or "down"
         count = params.get("count", 1)
 
