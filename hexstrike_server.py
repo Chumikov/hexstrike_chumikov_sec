@@ -5541,9 +5541,16 @@ class EnhancedProcessManager:
                     "context": context,
                     "status": "running"
                 }
+            # kill-switch visibility (same as EnhancedCommandExecutor):
+            # pool tasks ran invisible to kill-all — the lab showed sleeping
+            # tasks surviving an engaged kill switch.
+            _kill_switch_register(process.pid, process)
 
             # Monitor process execution
-            stdout, stderr = process.communicate()
+            try:
+                stdout, stderr = process.communicate()
+            finally:
+                _kill_switch_unregister(process.pid)
             execution_time = time.time() - start_time
 
             result = {
@@ -6926,9 +6933,15 @@ CACHE_SIZE = 2000  # Increased from 1000 for better performance
 CACHE_TTL = 7200   # Increased from 3600 to 2 hours for stable results
 
 class HexStrikeCache:
-    """Advanced caching system for command results"""
+    """Advanced caching system for command results (thread-safe).
+
+    Under gthread workers several request threads mutate the OrderedDict
+    concurrently — unlocked move_to_end/del corrupted LRU order and could
+    raise KeyError mid-iteration (audit finding; proven by the lab stress).
+    """
 
     def __init__(self, max_size: int = CACHE_SIZE, ttl: int = CACHE_TTL):
+        self._lock = threading.Lock()
         self.cache = OrderedDict()
         self.max_size = max_size
         self.ttl = ttl
@@ -6947,34 +6960,41 @@ class HexStrikeCache:
         """Get cached result if available and not expired"""
         key = self._generate_key(command, params)
 
-        if key in self.cache:
-            timestamp, data = self.cache[key]
-            if not self._is_expired(timestamp):
-                # Move to end (most recently used)
-                self.cache.move_to_end(key)
-                self.stats["hits"] += 1
-                logger.info(f"💾 Cache HIT for command: {command}")
-                return data
+        with self._lock:
+            if key in self.cache:
+                timestamp, data = self.cache[key]
+                if not self._is_expired(timestamp):
+                    # Move to end (most recently used)
+                    self.cache.move_to_end(key)
+                    self.stats["hits"] += 1
+                    cached = data
+                else:
+                    # Remove expired entry
+                    del self.cache[key]
+                    cached = None
             else:
-                # Remove expired entry
-                del self.cache[key]
-
-        self.stats["misses"] += 1
-        logger.info(f"🔍 Cache MISS for command: {command}")
-        return None
+                cached = None
+            if cached is None:
+                self.stats["misses"] += 1
+        if cached is not None:
+            logger.debug(f"💾 Cache HIT for command: {command}")
+        else:
+            logger.debug(f"🔍 Cache MISS for command: {command}")
+        return cached
 
     def set(self, command: str, params: Dict[str, Any], result: Dict[str, Any]):
         """Store result in cache"""
         key = self._generate_key(command, params)
 
-        # Remove oldest entries if cache is full
-        while len(self.cache) >= self.max_size:
-            oldest_key = next(iter(self.cache))
-            del self.cache[oldest_key]
-            self.stats["evictions"] += 1
+        with self._lock:
+            # Remove oldest entries if cache is full
+            while len(self.cache) >= self.max_size:
+                oldest_key = next(iter(self.cache))
+                del self.cache[oldest_key]
+                self.stats["evictions"] += 1
 
-        self.cache[key] = (time.time(), result)
-        logger.info(f"💾 Cached result for command: {command}")
+            self.cache[key] = (time.time(), result)
+        logger.debug(f"💾 Cached result for command: {command}")
 
     def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics"""
@@ -7039,6 +7059,30 @@ class TelemetryCollector:
 
 # Global telemetry collector
 telemetry = TelemetryCollector()
+
+# Synthetic session key under which tool subprocesses are registered with the
+# guardrails kill switch. engage(None) (kill-all) sweeps every session bucket,
+# so SIGTERM/SIGKILL reaches running nmap/sqlmap/... processes. Previously
+# NOTHING registered tool processes with the kill switch — the "emergency
+# stop" only blocked new dispatches while scans kept running (lab finding).
+_KILL_SWITCH_SESSION = "__tools__"
+
+
+def _kill_switch_register(pid: int, popen) -> None:
+    try:
+        from hexstrike_guardrails import get_state
+        get_state().kill_switch.register(_KILL_SWITCH_SESSION, pid, popen)
+    except Exception:
+        pass  # guardrails unavailable — the server still works
+
+
+def _kill_switch_unregister(pid: int) -> None:
+    try:
+        from hexstrike_guardrails import get_state
+        get_state().kill_switch.unregister(_KILL_SWITCH_SESSION, pid)
+    except Exception:
+        pass
+
 
 class EnhancedCommandExecutor:
     """Enhanced command executor with caching, progress tracking, and better output handling"""
@@ -7206,6 +7250,8 @@ class EnhancedCommandExecutor:
                 stderr=subprocess.PIPE,
                 stdin=subprocess.PIPE if self.stdin_data is not None else None,
                 text=True,
+                errors="replace",  # tool output may be binary/latin-1 — never
+                                  # let a decode error kill the reader thread
                 bufsize=1,
                 cwd=self.cwd,
             )
@@ -7222,6 +7268,8 @@ class EnhancedCommandExecutor:
 
             # Register process with ProcessManager (v5.0 enhancement)
             ProcessManager.register_process(pid, self.command, self.process)
+            # ...and with the guardrails kill switch so kill-all can stop it
+            _kill_switch_register(pid, self.process)
 
             # Start threads to read output continuously
             self.stdout_thread = threading.Thread(target=self._read_stdout)
@@ -7249,6 +7297,7 @@ class EnhancedCommandExecutor:
 
                 # Cleanup process from registry (v5.0 enhancement)
                 ProcessManager.cleanup_process(pid)
+                _kill_switch_unregister(pid)
 
                 if self.return_code == 0:
                     logger.info(f"✅ SUCCESS: Command completed | Exit Code: {self.return_code} | Duration: {execution_time:.2f}s")
@@ -7279,6 +7328,7 @@ class EnhancedCommandExecutor:
                 # Drain the reader threads so no late write races the result.
                 self.stdout_thread.join(timeout=1)
                 self.stderr_thread.join(timeout=1)
+                _kill_switch_unregister(pid)
 
             # Always consider it a success if we have output, even with timeout
             success = True if self.timed_out and (self.stdout_data or self.stderr_data) else (self.return_code == 0)
@@ -13762,8 +13812,16 @@ def dirsearch():
         logger.info(f"📁 Starting Dirsearch scan: {url}")
         result = execute_tool_command("dirsearch", argv, gr_params["target"],
                                       gr_params, cwd=workdir)
+        # Inline the report (bounded) and remove the temp workdir — leaving a
+        # directory per scan in /tmp leaks disk over an engagement (lab check).
+        try:
+            if os.path.isfile(report_file):
+                with open(report_file, "r", errors="replace") as f:
+                    result["report"] = f.read(65536)
+        except OSError:
+            pass
         result["report_file"] = report_file
-        result["workdir"] = workdir
+        shutil.rmtree(workdir, ignore_errors=True)
         logger.info(f"📊 Dirsearch scan completed for {url}")
         return _tool_response(result)
     except Exception as e:

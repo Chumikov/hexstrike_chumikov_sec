@@ -70,7 +70,7 @@ hexstrike_mcp.py  ──HTTP──►  hexstrike_server.py (Flask + gunicorn, :8
                                      └─ subprocess: nmap, nuclei, sqlmap, metasploit, …
 ```
 
-- **Сервер** — Flask-приложение под gunicorn (несколько воркеров, автоперезапуск по `--max-requests` от утечек памяти, systemd-интеграция с OOM-политиками и RAM-scaled лимитами). Слушает только `127.0.0.1`
+- **Сервер** — Flask-приложение под gunicorn (gthread-воркеры с потоками: долгие сканы не замораживают API, автоперезапуск по `--max-requests` с jitter от утечек памяти, systemd-интеграция с OOM-политиками и RAM-scaled лимитами). Слушает только `127.0.0.1`
 - **MCP-клиент** — FastMCP-сервер, мост между агентом и REST API: кэш, rate limiting, retry с exponential backoff, batch-запросы
 - **SQLite** (`data/hexstrike_sessions.db`) — единое хранилище guardrails, сессий, audit log и async-задач; всё переживает рестарт
 
@@ -92,7 +92,8 @@ hexstrike_mcp.py  ──HTTP──►  hexstrike_server.py (Flask + gunicorn, :8
 | `templates/health_panel.html` | Шаблон HTML-панели мониторинга |
 | `scripts/sync-upstream.sh` | Maintenance-синхронизация с upstream |
 | `tests/` | Unit-тесты (pytest) |
-| `scripts/synthetic_lab.py` | Синтетический полигон: функциональные сценарии + инъекции/guardrails/robustness (52 проверки) |
+| `scripts/synthetic_lab.py` | Синтетический полигон (95 проверок): живые цели (SQLi/XSS/redirect/soft-404/TLS/чёрная дыра/медленная/закрытый порт), MCP-слой по stdio, зависания, kill-семантика, auth-инстанс |
+| `scripts/mcp_client.py` | Минимальный stdio JSON-RPC клиент для полигона |
 | `.github/workflows/ci.yml` | CI: pytest на каждый push/PR |
 | `VERSION` / `CHANGELOG.md` | Версия (SemVer) и история релизов |
 
@@ -320,6 +321,16 @@ CLI-флаги `--transport`, `--host`, `--port` переопределяют en
 | `HEXSTRIKE_MAX_OUTPUT_BYTES` | `10485760` | Потолок захвата stdout+stderr подпроцесса; при превышении процесс убивается, результат помечается `output_truncated` (защита от flooding-бинарников) |
 | `HEXSTRIKE_HTTPX_BIN` | — | Явный путь к binary httpx. По умолчанию сервер функционально различает projectdiscovery/httpx и Python-клиент `httpx` (Kali-пакет `python3-httpx`): первый получает цели через stdin и полный набор флагов, второй используется как ограниченный fallback (URL позиционно), а tech-detect честно отвечает 501 с подсказкой установить PD-вариант |
 | `HEXSTRIKE_API_KEY` / `HEXSTRIKE_REQUIRE_AUTH` | — / `false` | API-аутентификация (`X-API-Key` / `Authorization: Bearer`) |
+
+## Синтетический полигон
+
+`scripts/synthetic_lab.py` — end-to-end проверка перед/после деплоя (95 проверок): поднимает одноразовый полигон на 127.0.0.1 (веб-сервер с настоящей SQLi, reflected XSS, redirect-цепочкой, soft-404 зоной, self-signed TLS, чёрной дырой, медленным и закрытым портами) и прогоняет функциональные сценарии реальными инструментами, MCP-слой по stdio (путь агента), guardrails-сценарии, инъекционную батарею, матрицу зависаний, freeze-пробу, дрейф флагов инструментов, kill-семантику, auth-режим и выживание async-задач.
+
+```bash
+python3 scripts/synthetic_lab.py             # полный прогон (~10 мин)
+python3 scripts/synthetic_lab.py --quick     # без медленных сканов
+HEXSTRIKE_LAB_SMOKE=1 sudo bash deploy.sh    # post-deploy smoke
+```
 
 ## Тесты и разработка
 

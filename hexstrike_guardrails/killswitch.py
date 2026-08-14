@@ -284,12 +284,23 @@ class KillSwitch:
 
     def _signal_one(self, entry: _RegisteredProc, kill_grace_sec: float) -> KillOutcome:
         """Send SIGTERM, wait, escalate to SIGKILL. Returns the outcome."""
+        # Shell-wrapped commands (`sh -c "cmd"`) leave the actual tool as a
+        # child: signalling only the wrapper orphans the tool. When the
+        # process runs in its own session/group (pool uses setsid) signal the
+        # whole group too.
+        def _kill_group(sig) -> None:
+            try:
+                os.killpg(entry.pid, sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
         # Prefer Popen API (works for current process tree).
         if entry.popen is not None:
             if entry.popen.poll() is not None:
                 return KillOutcome.NOT_FOUND
             try:
                 entry.popen.terminate()  # SIGTERM on POSIX
+                _kill_group(signal.SIGTERM)
             except ProcessLookupError:
                 return KillOutcome.NOT_FOUND
             except PermissionError:
@@ -304,6 +315,7 @@ class KillSwitch:
                 pass
             try:
                 entry.popen.kill()  # SIGKILL
+                _kill_group(signal.SIGKILL)
                 entry.popen.wait(timeout=kill_grace_sec)
                 return KillOutcome.FORCE_KILLED
             except Exception:

@@ -16,6 +16,7 @@ HEXSTRIKE_DIR="/usr/share/hexstrike-ai"
 SERVICE_FILE="/etc/systemd/system/hexstrike.service"
 HEXSTRIKE_PORT=8888
 WORKERS=2
+THREADS=8
 TIMEOUT=300
 MAX_REQUESTS=1000
 # OOM-resilience: лимиты масштабируются по RAM хоста (вариант A).
@@ -286,7 +287,7 @@ User=${RUN_USER}
 Group=${RUN_GROUP}
 WorkingDirectory=${HEXSTRIKE_DIR}
 Environment="${SYSTEMD_PATH}"
-ExecStart=${GUNICORN_WRAPPER} --bind 127.0.0.1:${HEXSTRIKE_PORT} --workers ${WORKERS} --timeout ${TIMEOUT} --max-requests ${MAX_REQUESTS} hexstrike_server:app
+ExecStart=${GUNICORN_WRAPPER} --bind 127.0.0.1:${HEXSTRIKE_PORT} --workers ${WORKERS} --worker-class gthread --threads ${THREADS} --timeout ${TIMEOUT} --graceful-timeout $((TIMEOUT + 20)) --max-requests ${MAX_REQUESTS} --max-requests-jitter 200 hexstrike_server:app
 ExecReload=/bin/kill -s HUP \$MAINPID
 Restart=always
 RestartSec=3
@@ -442,6 +443,19 @@ else
 fi
 
 # ============================================================================
+
+# Опциональный post-deploy smoke: HEXSTRIKE_LAB_SMOKE=1 запускает синтетический
+# полигон (--quick --skip-restart) из каталога исходников. Не блокирует деплой:
+# провалы выводятся как WARN (полный разбор — вручную).
+if [[ "${HEXSTRIKE_LAB_SMOKE:-0}" == "1" ]]; then
+    echo ""
+    warn "HEXSTRIKE_LAB_SMOKE=1: запускаю синтетический полигон (quick)…"
+    if python3 "${SCRIPT_DIR}/scripts/synthetic_lab.py" --quick --skip-restart 2>&1 | tail -25; then
+        ok "Синтетический полигон: пройден"
+    else
+        warn "Синтетический полигон: есть непройденные проверки — см. вывод выше"
+    fi
+fi
 
 step "Итог"
 
