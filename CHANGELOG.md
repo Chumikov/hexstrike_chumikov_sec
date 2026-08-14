@@ -27,6 +27,7 @@
   - потолок захвата stdout+stderr (`HEXSTRIKE_MAX_OUTPUT_BYTES`, по умолчанию 10 МБ; per-call override `max_output_bytes` в `/api/command`); при превышении процесс убивается, результат помечается `output_truncated: true` + `partial_results`
   - строки длиннее 2 КБ не пишутся в `hexstrike.log` (флуд больше не раздувает и лог)
 - **Наблюдение (audit-покрытие): `/api/command` исполнялся вне трассировки guardrails.** 145 команд → 1 запись в audit (только «tiered»-вызовы). Теперь перед исполнением bare-команды выполняется guardrails-check: имя инструмента выводится из бинарника, цель — из первого IP/URL/hostname токена команды; kill switch / scope / rate / tier-гейты и audit-лог покрывают и произвольные команды. Блокировка возвращает структурированный 403/429/503.
+- **Kill switch не был виден между gunicorn-воркерами** (найдено при live-верификации установки v6.4.8). Глобальный флаг читался из SQLite только в `KillSwitch.__init__` — `engage()` в одном воркере не блокировал проверки в соседних (in-memory копия устаревала). `is_engaged()` и `snapshot()` теперь считают строку DB источником истины (in-memory — fallback при недоступной DB). Подтверждено живьём: 6/6 запросов `/api/command` получают 503 после `kill-all` в другом воркере, после `reset` — 200.
 
 ### Добавлено
 
@@ -34,7 +35,7 @@
 
 ### Тесты
 
-- +40 (504 → 544, все зелёные): `tests/unit/test_field_fixes.py` (nmap-advanced builder/allowlists, httpx sniff/resolver/flag-mapping, output-cap на реальном flooding-процессе, stdin, `/api/command` под guardrails — audit-строка, block по scope/tier/kill, инференс tool/target), обновлён `test_optimizer.py` под новый дефолт dedup и inline-маркер
+- +41 (504 → 545, все зелёные): `tests/unit/test_field_fixes.py` (nmap-advanced builder/allowlists, httpx sniff/resolver/flag-mapping, output-cap на реальном flooding-процессе, stdin, `/api/command` под guardrails — audit-строка, block по scope/tier/kill, инференс tool/target, кросс-воркерная видимость kill-флага через два KillSwitch на одной DB), обновлён `test_optimizer.py` под новый дефолт dedup и inline-маркер
 
 
 ## [6.4.7] — 2026-08-11
