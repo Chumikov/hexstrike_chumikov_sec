@@ -7111,8 +7111,14 @@ class EnhancedCommandExecutor:
         # relative reports/ folder in the CWD — point it at a temp dir).
         self.cwd = cwd
         self.process = None
-        self.stdout_data = ""
-        self.stderr_data = ""
+        # Output buffers: chunk lists + running counters. A plain string
+        # `self.stdout_data += line` was O(n^2) — the reader crawled at
+        # ~27KB/s on multi-MB output (BUG-5 live repro), so neither the cap
+        # nor the kill could fire in time.
+        self._stdout_chunks: list = []
+        self._stderr_chunks: list = []
+        self._stdout_len = 0
+        self._stderr_len = 0
         self.stdout_thread = None
         self.stderr_thread = None
         self.return_code = None
@@ -7127,21 +7133,25 @@ class EnhancedCommandExecutor:
         process gets killed (once) so a flooding child cannot pin the
         executor for the full wall timeout.
         """
-        total = len(self.stdout_data) + len(self.stderr_data)
+        total = self._stdout_len + self._stderr_len
         if total + len(chunk) > self.max_output_bytes:
             room = self.max_output_bytes - total
             if room > 0:
                 if stream == "stdout":
-                    self.stdout_data += chunk[:room]
+                    self._stdout_chunks.append(chunk[:room])
+                    self._stdout_len += room
                 else:
-                    self.stderr_data += chunk[:room]
+                    self._stderr_chunks.append(chunk[:room])
+                    self._stderr_len += room
             self.output_truncated = True
             self._kill_on_output_cap()
             return False
         if stream == "stdout":
-            self.stdout_data += chunk
+            self._stdout_chunks.append(chunk)
+            self._stdout_len += len(chunk)
         else:
-            self.stderr_data += chunk
+            self._stderr_chunks.append(chunk)
+            self._stderr_len += len(chunk)
         return True
 
     def _kill_on_output_cap(self):
@@ -7150,24 +7160,54 @@ class EnhancedCommandExecutor:
         self._cap_kill_done = True
         logger.warning(
             f"🛑 OUTPUT CAP: {self.max_output_bytes} bytes exceeded — "
-            f"killing PID {self.process.pid if self.process else '?'}"
+            f"killing process group of PID {self.process.pid if self.process else '?'}"
         )
-        try:
-            self.process.terminate()
-        except Exception:
-            pass
+        # Group kill, NOT bare terminate(): a SIGTERM to the direct child
+        # (`sh -c`) leaves pipeline grandchildren (yes/head/…) holding the
+        # stdout pipe write-end — the executor then blocks waiting for EOF
+        # until the wall timeout while the writers leak (BUG-5).
+        self._terminate_group()
+
+    def _terminate_group(self, escalate_after: float = 2.0):
+        """Terminate the child's whole process group, escalating to SIGKILL.
+
+        Every executor child is spawned with ``start_new_session=True``, so
+        its PID is also its PGID and ``killpg`` reaches the entire pipeline
+        without risking the server's own group.
+        """
+        if self.process is None:
+            return
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(self.process.pid, sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                # not a group leader / already dead — fall back to the child
+                try:
+                    if sig is signal.SIGTERM:
+                        self.process.terminate()
+                    else:
+                        self.process.kill()
+                except Exception:
+                    pass
+                return
+            try:
+                self.process.wait(timeout=escalate_after)
+                return
+            except Exception:
+                continue  # group ignored the signal — escalate
 
     def _read_stdout(self):
         """Thread function to continuously read stdout"""
         try:
+            # NOTE: no per-line logging. A logger.info() per stdout line
+            # throttled the reader to ~50k lines/s — multi-MB outputs (the
+            # `yes | head -c 20M` BUG-5 repro) took minutes just to REACH the
+            # output cap, defeating the kill. Progress is reported by the
+            # progress thread instead.
             for line in iter(self.process.stdout.readline, ''):
                 if line:
                     if not self._append_output("stdout", line):
                         return
-                    # Real-time output display (skip very long lines so a
-                    # flooding child cannot also flood hexstrike.log)
-                    if len(line) <= 2000:
-                        logger.info(f"📤 STDOUT: {line.strip()}")
         except Exception as e:
             logger.error(f"Error reading stdout: {e}")
 
@@ -7178,8 +7218,6 @@ class EnhancedCommandExecutor:
                 if line:
                     if not self._append_output("stderr", line):
                         return
-                    if len(line) <= 2000:
-                        logger.warning(f"📥 STDERR: {line.strip()}")
         except Exception as e:
             logger.error(f"Error reading stderr: {e}")
 
@@ -7203,7 +7241,7 @@ class EnhancedCommandExecutor:
                     eta = ((elapsed / progress_percent) * 100) - elapsed
 
                 # Calculate speed
-                bytes_processed = len(self.stdout_data) + len(self.stderr_data)
+                bytes_processed = self._stdout_len + self._stderr_len
                 speed = f"{bytes_processed/elapsed:.0f} B/s" if elapsed > 0 else "0 B/s"
 
                 # Update process manager with progress
@@ -7254,6 +7292,9 @@ class EnhancedCommandExecutor:
                                   # let a decode error kill the reader thread
                 bufsize=1,
                 cwd=self.cwd,
+                start_new_session=True,  # child leads its own pgroup:
+                                         # killpg() can reach pipeline
+                                         # grandchildren (BUG-5)
             )
 
             if self.stdin_data is not None:
@@ -7312,16 +7353,13 @@ class EnhancedCommandExecutor:
 
                 # Process timed out but we might have partial results
                 self.timed_out = True
-                logger.warning(f"⏰ TIMEOUT: Command timed out after {self.timeout}s | Terminating PID {self.process.pid}")
+                logger.warning(f"⏰ TIMEOUT: Command timed out after {self.timeout}s | Killing process group of PID {self.process.pid}")
 
-                # Try to terminate gracefully first
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    # Force kill if it doesn't terminate
-                    logger.error(f"🔪 FORCE KILL: Process {self.process.pid} not responding to termination")
-                    self.process.kill()
+                # Group kill: a bare terminate() only reached `sh -c`,
+                # orphaning pipeline grandchildren that kept the stdout pipe
+                # open — same deadlock/leak class as the output-cap path
+                # (BUG-5).
+                self._terminate_group(escalate_after=5)
 
                 self.return_code = -1
                 telemetry.record_execution(False, execution_time)
@@ -7331,10 +7369,10 @@ class EnhancedCommandExecutor:
                 _kill_switch_unregister(pid)
 
             # Always consider it a success if we have output, even with timeout
-            success = True if self.timed_out and (self.stdout_data or self.stderr_data) else (self.return_code == 0)
+            success = True if self.timed_out and (self._stdout_len or self._stderr_len) else (self.return_code == 0)
 
             # Log enhanced final results with summary using ModernVisualEngine
-            output_size = len(self.stdout_data) + len(self.stderr_data)
+            output_size = self._stdout_len + self._stderr_len
             execution_time = self.end_time - self.start_time if self.end_time else 0
 
             # Create status summary
@@ -7361,12 +7399,12 @@ class EnhancedCommandExecutor:
                     logger.info(line)
 
             result = {
-                "stdout": self.stdout_data,
-                "stderr": self.stderr_data,
+                "stdout": "".join(self._stdout_chunks),
+                "stderr": "".join(self._stderr_chunks),
                 "return_code": self.return_code,
                 "success": success,
                 "timed_out": self.timed_out,
-                "partial_results": (self.timed_out or self.output_truncated) and (self.stdout_data or self.stderr_data),
+                "partial_results": (self.timed_out or self.output_truncated) and bool(self._stdout_len or self._stderr_len),
                 "output_truncated": self.output_truncated,
                 "execution_time": self.end_time - self.start_time if self.end_time else 0,
                 "timestamp": datetime.now().isoformat()
@@ -7388,12 +7426,12 @@ class EnhancedCommandExecutor:
             telemetry.record_execution(False, execution_time)
 
             return {
-                "stdout": self.stdout_data,
-                "stderr": f"Error executing command: {str(e)}\n{self.stderr_data}",
+                "stdout": "".join(self._stdout_chunks),
+                "stderr": f"Error executing command: {str(e)}\n{''.join(self._stderr_chunks)}",
                 "return_code": -1,
                 "success": False,
                 "timed_out": False,
-                "partial_results": bool(self.stdout_data or self.stderr_data),
+                "partial_results": bool(self._stdout_len or self._stderr_len),
                 "execution_time": execution_time,
                 "timestamp": datetime.now().isoformat()
             }

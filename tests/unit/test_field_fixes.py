@@ -11,6 +11,7 @@ Covers the four confirmed bugs + the audit-coverage observation:
 from __future__ import annotations
 
 import re
+import time
 
 import pytest
 
@@ -248,6 +249,49 @@ class TestOutputCap:
         assert result["output_truncated"] is False
         assert result["stdout"].strip() == "hello"
         assert "output_cap_bytes" not in result
+
+    def test_cap_kills_whole_pipeline_group(self):
+        # BUG-5: `yes | head -c N` with N far above the cap. head blocks
+        # writing into the full stdout pipe, yes blocks behind head — a
+        # SIGTERM to the direct `sh -c` child left both alive holding the
+        # write-end: executor deadlocked until the wall timeout and the
+        # writers leaked. The group kill must return fast and leave nothing.
+        import subprocess as sp
+        exe = server.EnhancedCommandExecutor(
+            ["bash", "-c", "yes BUG5MARK | head -c 20971520"],
+            timeout=60, max_output_bytes=1_000_000)
+        result = exe.execute()
+        assert result["output_truncated"] is True
+        assert result["execution_time"] < 30
+        leaked = 0
+        for _ in range(10):  # give the reaper a moment
+            leaked = 0
+            r = sp.run(["pgrep", "-fc", "yes BUG5MARK"],
+                       capture_output=True, text=True)
+            try:
+                leaked = int(r.stdout.strip() or 0)
+            except ValueError:
+                leaked = 0
+            if leaked == 0:
+                break
+            time.sleep(0.5)
+        assert leaked == 0, "yes survived the output-cap kill"
+
+    def test_timeout_kills_whole_pipeline_group(self):
+        # Same orphan class on the wall-timeout path: `sleep 30 | sleep 30`
+        # must not leave grandchildren behind after the 3s timeout.
+        import subprocess as sp
+        exe = server.EnhancedCommandExecutor(
+            ["bash", "-c", "sleep 30 | sleep 30"], timeout=3)
+        result = exe.execute()
+        assert result["timed_out"] is True
+        assert result["execution_time"] < 20
+        r = sp.run(["pgrep", "-fc", "sleep 30"], capture_output=True, text=True)
+        try:
+            leaked = int(r.stdout.strip() or 0)
+        except ValueError:
+            leaked = 0
+        assert leaked == 0, "pipeline grandchildren survived the timeout kill"
 
     def test_stdin_data_is_written_to_child(self):
         exe = server.EnhancedCommandExecutor(["cat"], stdin_data="probe-me\n")

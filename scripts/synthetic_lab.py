@@ -632,6 +632,19 @@ def test_hang_matrix(lab: Lab):
     check("hang-matrix: curl к чёрной дыре — сервер вернулся структурно",
           st == 200 and dt < 120, f"за {dt:.0f}s")
 
+    # BUG-5: infinite writer behind a finite reader (yes | head -c N, N > cap).
+    # head blocks writing into the full pipe, yes blocks behind head; a
+    # child-only SIGTERM deadlocks the executor and leaks both writers.
+    t0 = time.time()
+    st, r = api("/api/command",
+                {"command": "yes 'BUG5MARK' | head -c 20971520",
+                 "use_cache": False}, timeout=120)
+    dt = time.time() - t0
+    leaked = pgrep("yes .BUG5MARK.")
+    check("BUG-5: yes|head поверх капа — быстрый возврат, писатели НЕ утекли",
+          st == 200 and dt < 60 and r.get("output_truncated") is True and leaked == 0,
+          f"за {dt:.0f}s, утекло {leaked}")
+
 
 def test_api_freeze(lab: Lab, quick: bool):
     print("\n━━━ Заморозка API при параллельных долгих сканах ━━━")
