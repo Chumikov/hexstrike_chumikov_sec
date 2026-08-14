@@ -196,17 +196,34 @@ class KillSwitch:
         """Track a process so it can be killed later.
 
         Safe to call from any thread; no-op if ``pid`` is not a positive int.
+        The PID is also persisted to the shared registry so a kill-all issued
+        in ANOTHER gunicorn worker (whose in-memory ``_procs`` is empty) can
+        still signal it.
         """
         if not session_id or not isinstance(pid, int) or pid <= 0:
             return
         entry = _RegisteredProc(pid=pid, popen=popen)
         with self._lock:
             self._procs.setdefault(session_id, set()).add(entry)
+        try:
+            with get_connection() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO kill_switch_procs"
+                    "(pid, session_id, created_at) VALUES (?, ?, ?)",
+                    (pid, session_id, _utc_now_iso()),
+                )
+        except Exception:
+            logger.debug("kill_switch: cannot persist pid=%d", pid, exc_info=True)
 
     def unregister(self, session_id: str, pid: int) -> None:
         """Drop a previously-registered process (e.g. after clean exit)."""
         if not session_id or not isinstance(pid, int) or pid <= 0:
             return
+        try:
+            with get_connection() as conn:
+                conn.execute("DELETE FROM kill_switch_procs WHERE pid = ?", (pid,))
+        except Exception:
+            logger.debug("kill_switch: cannot unpersist pid=%d", pid, exc_info=True)
         with self._lock:
             procs = self._procs.get(session_id)
             if not procs:
@@ -275,6 +292,41 @@ class KillSwitch:
                 if not self._procs.get(session_id):
                     self._procs.pop(session_id, None)
 
+            # Shared-registry sweep: signal PIDs registered by OTHER workers
+            # (this worker's own are handled above; dead ones come back as
+            # NOT_FOUND). Without this, kill-all served by worker B never
+            # touched processes spawned by worker A (lab flaky-catch).
+            try:
+                with get_connection() as conn:
+                    if session_id is None:
+                        rows = conn.execute(
+                            "SELECT pid FROM kill_switch_procs").fetchall()
+                        del_sql = "DELETE FROM kill_switch_procs"
+                        del_args: tuple = ()
+                    else:
+                        rows = conn.execute(
+                            "SELECT pid FROM kill_switch_procs WHERE session_id = ?",
+                            (session_id,)).fetchall()
+                        del_sql = ("DELETE FROM kill_switch_procs "
+                                   "WHERE session_id = ?")
+                        del_args = (session_id,)
+                    for row in rows:
+                        pid = int(row["pid"])
+                        if pid in report.outcomes:
+                            continue  # already signalled via the in-memory set
+                        entry = _RegisteredProc(pid=pid, popen=None)
+                        outcome = self._signal_one(entry, kill_grace_sec)
+                        report.outcomes[pid] = outcome
+                        if outcome in (KillOutcome.TERMINATED,
+                                       KillOutcome.FORCE_KILLED,
+                                       KillOutcome.NOT_FOUND):
+                            report.killed.append(pid)
+                        else:
+                            report.failed.append(pid)
+                    conn.execute(del_sql, del_args)
+            except Exception:
+                logger.exception("kill_switch: shared-registry sweep failed")
+
         self._record_event(report)
         logger.warning(
             "kill_switch engaged: session=%s reason=%s killed=%d failed=%d",
@@ -322,9 +374,13 @@ class KillSwitch:
                 logger.exception("kill_switch: kill() failed for pid=%d", entry.pid)
                 return KillOutcome.ERROR
 
-        # Fall back to OS signals when only a PID is known.
+        # Fall back to OS signals when only a PID is known (shared-registry
+        # sweep of processes spawned by other workers). Signal the process
+        # group too: pool commands run via `sh -c` + setsid, so the real
+        # tool is a child that a pid-only SIGTERM would orphan.
         try:
             os.kill(entry.pid, signal.SIGTERM)
+            _kill_group(signal.SIGTERM)
         except ProcessLookupError:
             return KillOutcome.NOT_FOUND
         except PermissionError:
@@ -342,6 +398,7 @@ class KillSwitch:
 
         try:
             os.kill(entry.pid, signal.SIGKILL)
+            _kill_group(signal.SIGKILL)
         except ProcessLookupError:
             return KillOutcome.NOT_FOUND  # died between SIGTERM and SIGKILL
         except Exception:

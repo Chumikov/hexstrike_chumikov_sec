@@ -9584,8 +9584,11 @@ def health_check():
     for tool in all_tools:
         try:
             clean_name = tool.rstrip("*")
-            result = execute_command(f"which {clean_name}", use_cache=True)
-            tools_status[tool] = result["success"]
+            # shutil.which, NOT execute_command("which …"): the old form
+            # spawned ~140 subprocesses + wrote an audit row for each on
+            # EVERY /health call — tens of seconds under load and the freeze
+            # the lab's probe caught.
+            tools_status[tool] = shutil.which(clean_name) is not None
         except:
             tools_status[tool] = False
 

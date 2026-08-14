@@ -144,3 +144,13 @@ CREATE TABLE IF NOT EXISTS async_tasks (
 CREATE INDEX IF NOT EXISTS idx_async_tasks_status ON async_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_async_tasks_submitted ON async_tasks(submitted_at);
 
+
+-- Shared PID registry for the kill switch (v6.5.0+). Each gunicorn worker
+-- registers the tool processes it spawns; kill-all issued via ANY worker
+-- reads this table and signals every PID, so the emergency stop works
+-- across workers (in-memory _procs alone is per-process).
+CREATE TABLE IF NOT EXISTS kill_switch_procs (
+    pid        INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);

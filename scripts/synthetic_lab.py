@@ -900,8 +900,9 @@ def test_auth_mode():
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         base = f"http://127.0.0.1:{port}"
+        # Импорт 742КБ-модуля + init — под нагрузкой старта занимает ~10-30с
         up = False
-        for _ in range(40):
+        for _ in range(120):
             try:
                 urllib.request.urlopen(f"{base}/health", timeout=2).read()
                 up = True
@@ -909,7 +910,7 @@ def test_auth_mode():
             except Exception:
                 time.sleep(0.5)
         if not up:
-            check("auth-инстанс: поднялся на :8889", False, "health не ответил за 20s")
+            check("auth-инстанс: поднялся на :8889", False, "health не ответил за 60s")
             return
 
         def probe(path, method="GET", payload=None, key=None):
