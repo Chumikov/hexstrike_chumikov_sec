@@ -42,11 +42,15 @@ def _build_mcp_with_profile(profile: str | None, aliases: str | None = None):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("profile,expected_count,expected_subset", [
-    ("minimal", 4, {"execute_command", "intelligent_smart_scan",
-                    "analyze_target_intelligence", "batch_execute"}),
-    ("recon", 7, {"port_scan", "subdomain_enum", "http_probe"}),
-    ("web", 9, {"directory_brute", "web_vuln_scan"}),
-    ("exploit", 13, {"sqlmap_scan", "hydra_attack", "metasploit_run", "cloud_audit"}),
+    # v6.6.0: create_file joined _MINIMAL — it is the file bridge into the
+    # server execution context and must never be profiled away (debrief
+    # BUG-5), so every lean profile grew by exactly one tool.
+    ("minimal", 5, {"execute_command", "intelligent_smart_scan",
+                    "analyze_target_intelligence", "batch_execute",
+                    "create_file"}),
+    ("recon", 8, {"port_scan", "subdomain_enum", "http_probe"}),
+    ("web", 10, {"directory_brute", "web_vuln_scan"}),
+    ("exploit", 14, {"sqlmap_scan", "hydra_attack", "metasploit_run", "cloud_audit"}),
 ])
 def test_profile_registers_correct_subset(profile, expected_count, expected_subset):
     """Each lean profile must register exactly expected_count tools including expected_subset."""

@@ -5,6 +5,30 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/),
 версионирование — [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [6.6.0] — 2026-08-16
+
+Дебрифинг после лабораторного CTF-прогона: 6 из 9 пунктов закрыты кодом (BUG-1/2/3/4/6/9 + половина BUG-5), остальные два с половиной — архитектурные ограничения, задокументированы ниже и в описаниях инструментов.
+
+### Исправлено
+
+- **BUG-1: `http_probe(mode=tech-detect)` отвечал 501 и сдавался.** Когда на сервере резолвится Python `encode/httpx` (или бинарника нет вовсе), роут `/api/tools/httpx` возвращал 501/503 вместо результата. Теперь probe/tech-detect обслуживаются встроенным Python-зондом: `requests` + `TechnologyDetector` → статус, title, web-server, технологии, флаг `behind_cloudflare`, метка `fallback: builtin-http-probe`. Зонд гейтится guardrails (scope/tier/kill/rate) как любой инструмент.
+- **BUG-2: `directory_brute` умирал на catch-all сайтах с escalate_to_human.** Сайты вида «200 + `頁面整理中` на любой путь» валили gobuster wildcard-ошибкой, generic-recovery жёг попытки и эскалировал. Теперь роут перед сканом зондирует два случайных пути: одинаковые статус+длина → `--exclude-length <len>` добавляется до первого запуска (с учётом `-s`/`-b` пользователя); если gobuster всё равно упал на wildcard-прекheckе — ровно один ретрай с фильтром. В ответе — `wildcard_recovery` с пояснением.
+- **BUG-3: кэш `execute_command` возвращал протухшие результаты (TTL 2ч, хиты 0%).** Кэширование выключено по умолчанию на всех слоях: `execute_command`/`execute_command_with_recovery`/`/api/command`/`/api/error-handling/execute-with-recovery` на сервере, глагол и клиент в MCP. Идентичные команды снова бьют в реальный мир; opt-in — `use_cache=true` для детерминированных команд.
+- **BUG-4: sqlmap дважды 403-блокировался на легитимных CTF-целях при проходящих nmap/curl.** По коду это tier-гейт, не scope: sqlmap/hydra — DESTRUCTIVE (требует подтверждения), nmap — INTRUSIVE. Тупика больше нет: 403-detail объясняет, как авторизовать вызов, а MCP-глаголы `sqlmap_scan`/`hydra_attack` принимают `confirmed=true` (дефолт False — гейт сохранён).
+- **BUG-6: hydra навязывала `-l` и не умела http-json (`Unknown service: http-json`, vanilla hydra 9.x модуля не имеет).** Username больше не обязателен (hydra сама принимает `-P`-only и `-C`); для `service=http-json` — встроенный брутфорсер JSON-API логинов: `json_body` с плейсхолдерами `^USER^`/`^PASS^`, `success_marker`/`failure_marker`, лимиты попыток/времени, детект CDN-блока. Роут hydra переведён с голого `execute_command` на guardrails-диспетчеризацию (как sqlmap).
+- **BUG-9: nuclei/nikto молчали на catch-all/Cloudflare целях.** Пустой stdout успешного скана теперь сопровождается `hints`: `catch_all_target` (каждый путь отвечает одинаково — сканер здесь ненадёжен, проверяй руками) или `cloudflare_block` (CDN режет CLI-сканеры — веди трафик через браузер).
+- **BUG-5 (половина): файлового моста не было видно агенту.** `create_file` был `full_only` — в lean-профилях (recon/web/exploit) агент строил base64-контрабанду через `execute_command` вместо готового глагола. Теперь `create_file` регистрируется во всех профилях, docstring прямо говорит: это мост для файлов, нужных `execute_command` в контексте сервера.
+
+### Осознанные ограничения (не фиксы, задокументировано)
+
+- **BUG-5 (вторая половина): три контекста исполнения (браузер ↔ hexstrike-сервер ↔ локальный bash) остаются тремя контекстами.** Мосты: `create_file` (файлы для сервера), `execute_command` (чтение результатов). Локальный bash-контекст MCP-серверу недоступен by design.
+- **BUG-7: Cloudflare.** Полноценный обход CDN (impersonation, browser-session reuse) — отдельный проект; сделано что могло быть сделано дёшево: все встроенные HTTP-зонды шлют браузерные заголовки и детектят CDN-блок с внятным hint (см. BUG-9).
+- **BUG-8: стриминга прогресса нет.** Долгие сканы остаются синхронными; воркараунд уже есть — `/api/process/execute-async` + `get-task-result` (поллинг). Клиентский таймаут MCP 300с покрывает текущие прогоны.
+
+### Тесты
+
+- +25 unit (577 total, все зелёные): builtin-зонд (детект технологий, CF-флаг, роут без PD-бинарника), wildcard-сигнатура/проба/парсинг `-s`/ретрай-маршрут, кэш-дефолты (реальное повторное исполнение + opt-in), tier-confirm (подсказка в 403, confirmed проходит, роут принимает флаг), http-json брутфорс (успех/400-валидации/tier-блок/`-l` не навязан), hints для nuclei/nikto. Обновлены ожидания профилей MCP (+`create_file`).
+
 ## [6.5.1] — 2026-08-14
 
 ### Исправлено

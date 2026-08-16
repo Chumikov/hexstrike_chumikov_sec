@@ -250,8 +250,13 @@ class GuardrailsState:
             self.audit.log(session_id, tool, target, tier,
                            AuditStatus.BLOCKED_TIER,
                            error="destructive requires confirmation")
+            # Lab-debrief BUG-4: the block used to be a dead end — the MCP
+            # verbs exposed no way to confirm, so legit in-scope sqlmap/hydra
+            # runs failed with 403 while nmap sailed through. Keep the gate,
+            # but tell the caller exactly how to authorise the call.
             return Decision(False, tier, reason="tier",
-                            detail="destructive requires confirmation",
+                            detail="destructive requires confirmation "
+                                   "(pass confirmed=true in the tool call)",
                             duration_ms=_elapsed_ms(start))
 
         # 4) Rate limit (concurrency + rps).

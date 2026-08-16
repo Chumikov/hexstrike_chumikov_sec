@@ -9067,7 +9067,7 @@ cve_intelligence = CVEIntelligenceManager()
 exploit_generator = AIExploitGenerator()
 vulnerability_correlator = VulnerabilityCorrelator()
 
-def execute_command(command, use_cache: bool = True,
+def execute_command(command, use_cache: bool = False,
                     stdin_data: str = None, max_output_bytes: int = None,
                     cwd: str = None) -> Dict[str, Any]:
     """
@@ -9077,7 +9077,12 @@ def execute_command(command, use_cache: bool = True,
         command: The command to execute — either a str (legacy, shell=True)
             or a list[str] (safe, shell=False). List form is preferred for any
             command built from user-controlled input.
-        use_cache: Whether to use caching for this command
+        use_cache: Whether to use caching for this command. Default OFF
+            (lab-debrief BUG-3): identical commands rarely mean identical
+            results in the real world — rotating CTF instances, restarted
+            services, changed files all made 2-hour-old cached stdout lie
+            to the agent with a straight face. Opt in per call when a
+            command is genuinely deterministic.
         stdin_data: Optional string written to the child's stdin (e.g. the
             target list piped into httpx).
         max_output_bytes: Per-call override of the output capture cap.
@@ -9115,7 +9120,7 @@ def execute_command(command, use_cache: bool = True,
     return result
 
 def execute_command_with_recovery(tool_name: str, command: str, parameters: Dict[str, Any] = None,
-                                 use_cache: bool = True, max_attempts: int = 3,
+                                 use_cache: bool = False, max_attempts: int = 3,
                                  stdin_data: str = None, max_output_bytes: int = None,
                                  cwd: str = None) -> Dict[str, Any]:
     """
@@ -9822,7 +9827,9 @@ def generic_command():
     try:
         params = request.json or {}
         command = params.get("command", "")
-        use_cache = params.get("use_cache", True)
+        # Cache OFF by default (lab-debrief BUG-3): arbitrary commands must
+        # re-run for fresh state unless the caller explicitly opts in.
+        use_cache = params.get("use_cache", False)
 
         if not command:
             logger.warning("⚠️  Command endpoint called without command parameter")
@@ -11234,8 +11241,6 @@ def gobuster():
             except ValueError as exc:
                 return jsonify({"error": f"Invalid additional_args: {exc}"}), 400
 
-        logger.info(f"📁 Starting Gobuster {mode} scan: {url}")
-
         tool_params = {
             "target": _host_of(url),
             "mode": mode,
@@ -11243,8 +11248,86 @@ def gobuster():
             "additional_args": additional_args,
             "use_recovery": use_recovery,
         }
+
+        # --- catch-all (wildcard) auto-recovery (lab debrief BUG-2) ---------
+        # A catch-all site answers 200 with a fixed body for ANY path; gobuster
+        # bails with "status code matches for non existing directories" and the
+        # generic recovery loop used to burn its attempts and escalate to a
+        # human — a dead end for an autonomous agent. Instead: probe two random
+        # paths, and when they agree add --exclude-length up front so the scan
+        # runs once, correctly filtered.
+        recovery_notes = []
+        if mode == "dir" and "--exclude-length" not in argv:
+            host = tool_params["target"]
+            state, decision = _guardrails_preflight(
+                "gobuster", host, params=tool_params,
+                confirmed=bool(params.get("confirmed")))
+            if decision is not None and not decision.allowed:
+                return _guardrails_block_response("gobuster", host, decision)
+            try:
+                wl = probe_catch_all(url)
+            except Exception:
+                wl = None
+            finally:
+                if state is not None and decision is not None and decision.allowed:
+                    try:
+                        state.release_target(host)
+                    except Exception:
+                        pass
+            if wl is not None:
+                matched = _gobuster_declared_status_codes(argv) \
+                    or _GOBUSTER_DEFAULT_MATCH
+                if wl["status"] in matched:
+                    argv += ["--exclude-length", str(wl["length"])]
+                    recovery_notes.append(
+                        f"catch-all detected (status={wl['status']}, "
+                        f"len={wl['length']}); auto-added --exclude-length "
+                        f"{wl['length']}")
+
+        logger.info(f"📁 Starting Gobuster {mode} scan: {url}")
+
         result = execute_tool_command("gobuster", argv, tool_params["target"],
                                       tool_params)
+
+        # Belt and braces: if gobuster still died on the wildcard pre-check
+        # (probe raced, non-default flags, flaky length), measure and retry
+        # exactly once with filtering instead of escalating to a human.
+        combined = f"{result.get('stdout', '')}\n{result.get('stderr', '')}" \
+            if isinstance(result, dict) else ""
+        if (mode == "dir" and isinstance(result, dict)
+                and not result.get("success")
+                and _looks_like_gobuster_wildcard_error(combined)):
+            host = tool_params["target"]
+            state, decision = _guardrails_preflight(
+                "gobuster", host, params=tool_params,
+                confirmed=bool(params.get("confirmed")))
+            if decision is None or decision.allowed:
+                try:
+                    wl = probe_catch_all(url)
+                except Exception:
+                    wl = None
+                finally:
+                    if state is not None and decision is not None \
+                            and decision.allowed:
+                        try:
+                            state.release_target(host)
+                        except Exception:
+                            pass
+                if wl is not None:
+                    retry_argv = [a for a in argv if a != "--exclude-length"]
+                    retry_argv += ["--exclude-length", str(wl["length"])]
+                    recovery_notes.append(
+                        f"gobuster wildcard bail; retried with "
+                        f"--exclude-length {wl['length']} "
+                        f"(status={wl['status']})")
+                    logger.info(f"🔁 Gobuster wildcard retry with "
+                                f"--exclude-length {wl['length']}")
+                    result = execute_tool_command("gobuster", retry_argv,
+                                                  tool_params["target"],
+                                                  tool_params)
+
+        if isinstance(result, dict) and recovery_notes:
+            result["wildcard_recovery"] = recovery_notes
 
         logger.info(f"📊 Gobuster scan completed for {url}")
         return _tool_response(result)
@@ -11305,6 +11388,14 @@ def nuclei():
             "use_recovery": use_recovery,
         }
         result = execute_tool_command("nuclei", argv, target, tool_params)
+
+        # Zero findings on an empty stdout can also mean "target eats CLI
+        # scanners" (catch-all / CDN) — attach why (lab-debrief BUG-9).
+        if (isinstance(result, dict) and result.get("success")
+                and not (result.get("stdout") or "").strip()):
+            hints = _silent_target_hints(target, "nuclei", tool_params)
+            if hints:
+                result["hints"] = hints
 
         logger.info(f"📊 Nuclei scan completed for {target}")
         return _tool_response(result)
@@ -11858,6 +11949,14 @@ def nikto():
         gr_params["target"] = _host_of(target)
         logger.info(f"🔬 Starting Nikto scan: {target}")
         result = execute_tool_command("nikto", argv, gr_params["target"], gr_params)
+
+        # Same BUG-9 treatment as nuclei: explain an empty-but-successful run.
+        if (isinstance(result, dict) and result.get("success")
+                and not (result.get("stdout") or "").strip()):
+            hints = _silent_target_hints(target, "nikto", gr_params)
+            if hints:
+                result["hints"] = hints
+
         logger.info(f"📊 Nikto scan completed for {target}")
         return _tool_response(result)
     except Exception as e:
@@ -11972,6 +12071,150 @@ def metasploit():
             except Exception as e:
                 logger.warning(f"Error removing temporary resource file: {str(e)}")
 
+def _hydra_http_json_brute(params: Dict[str, Any],
+                           max_attempts: int = 50000,
+                           wall_timeout: float = 300.0):
+    """Built-in JSON-API login brute force (lab-debrief BUG-6).
+
+    Vanilla hydra (9.x) has no ``http-json`` module — the lab agent hit
+    ``Unknown service: http-json`` and had no way to brute a custom JSON
+    login endpoint. This helper speaks it directly:
+
+      * ``url`` (or ``target``) — the login endpoint, full URL;
+      * ``json_body`` — request template with ``^USER^`` / ``^PASS^``
+        placeholders (hydra's http-form syntax);
+      * ``success_marker`` — substring present in a successful response
+        (e.g. ``"token"``), or ``failure_marker`` — substring present in
+        a failed one; one of the two is required;
+      * username/password credentials come from the regular hydra fields.
+
+    Guardrails: same tier/scope/rate gates as an argv hydra run (hydra is
+    DESTRUCTIVE — ``confirmed=true`` is required unless autoconfirm is on).
+    """
+    url = params.get("url") or params.get("target", "")
+    json_body = params.get("json_body", "")
+    success_marker = params.get("success_marker", "")
+    failure_marker = params.get("failure_marker", "")
+    username = params.get("username", "")
+    username_file = params.get("username_file", "")
+    password = params.get("password", "")
+    password_file = params.get("password_file", "")
+    delay = float(params.get("delay", 0) or 0)
+
+    if not url:
+        return jsonify({"error": "url is required for http-json brute"}), 400
+    if not json_body or ("^USER^" not in json_body and "^PASS^" not in json_body):
+        return jsonify({
+            "error": "json_body is required and must contain ^USER^ or ^PASS^",
+            "example": '{"username": "^USER^", "password": "^PASS^"}',
+        }), 400
+    if not success_marker and not failure_marker:
+        return jsonify({
+            "error": "success_marker or failure_marker is required "
+                     "(how to tell a hit from a miss)",
+        }), 400
+    if not (password or password_file):
+        return jsonify({"error": "password or password_file is required"}), 400
+
+    try:
+        url = validate_url(url)
+    except ValueError as exc:
+        return jsonify({"error": f"Invalid url: {exc}"}), 400
+
+    def _read_lines(path, cap):
+        try:
+            with open(path, "r", errors="replace") as fh:
+                return [ln.rstrip("\n") for ln in fh if ln.strip()][:cap]
+        except OSError as exc:
+            return None, exc
+
+    usernames = [username] if username else []
+    if username_file:
+        loaded = _read_lines(username_file, 1000)
+        if isinstance(loaded, tuple):
+            return jsonify({"error": f"cannot read username_file: {loaded[1]}"}), 400
+        usernames = loaded or usernames or [""]
+    if not usernames:
+        usernames = [""]
+
+    if password:
+        passwords = [password]
+    else:
+        loaded = _read_lines(password_file, max_attempts)
+        if isinstance(loaded, tuple):
+            return jsonify({"error": f"cannot read password_file: {loaded[1]}"}), 400
+        passwords = loaded
+        if not passwords:
+            return jsonify({"error": "password_file is empty"}), 400
+
+    host = _host_of(url) or url
+    state, decision = _guardrails_preflight(
+        "hydra", host, params=params, confirmed=bool(params.get("confirmed")))
+    if decision is not None and not decision.allowed:
+        return _guardrails_block_response("hydra", host, decision)
+
+    logger.info(f"🔑 Built-in http-json brute: {url} "
+                f"({len(usernames)} users x {len(passwords)} passwords)")
+
+    def _succeeded(resp) -> bool:
+        text = resp.text or ""
+        if success_marker:
+            return success_marker in text
+        if failure_marker:
+            return failure_marker not in text
+        return resp.status_code == 200
+
+    found, attempts, first_error = [], 0, None
+    started = time.time()
+    try:
+        for pw in passwords:
+            for user in usernames:
+                if attempts >= max_attempts or time.time() - started > wall_timeout:
+                    break
+                attempts += 1
+                body = json_body.replace("^USER^", user).replace("^PASS^", pw)
+                try:
+                    resp = _http_fetch(url, method="POST", raw_body=body)
+                except Exception as exc:
+                    first_error = first_error or str(exc)
+                    continue
+                if attempts == 1 and _is_cdn_blocked(resp):
+                    return jsonify({
+                        "success": False,
+                        "error": "target is behind a CDN block page "
+                                 "(Cloudflare-style 403/429/503)",
+                        "hint": "drive the requests through a browser "
+                                "session instead of direct HTTP",
+                        "tool": "builtin-http-json-brute",
+                    })
+                if _succeeded(resp):
+                    found.append({"username": user, "password": pw})
+                    logger.info(f"🔓 http-json brute hit: {user!r}")
+                    if not params.get("keep_going"):
+                        break
+                if delay > 0:
+                    time.sleep(delay)
+            if found and not params.get("keep_going"):
+                break
+    finally:
+        if state is not None and decision is not None and decision.allowed:
+            try:
+                state.release_target(host)
+            except Exception:
+                pass
+
+    return jsonify({
+        "success": True,
+        "tool": "builtin-http-json-brute",
+        "target": url,
+        "found": bool(found),
+        "credentials": found,
+        "attempts": attempts,
+        "elapsed_s": round(time.time() - started, 1),
+        "first_error": first_error,
+    })
+
+
 @app.route("/api/tools/hydra", methods=["POST"])
 def hydra():
     """Execute hydra with enhanced logging"""
@@ -11991,11 +12234,20 @@ def hydra():
                 "error": "Target and service parameters are required"
             }), 400
 
-        if not (username or username_file) or not (password or password_file):
-            logger.warning("🔑 Hydra called without username/password parameters")
+        # Lab-debrief BUG-6: a username is no longer mandatory. Hydra itself
+        # accepts password-only brute (-P) and -C colon files, and modules
+        # like http-post-form carry the login inside the module options.
+        if not (username or username_file or password or password_file
+                or additional_args):
+            logger.warning("🔑 Hydra called without any credential parameters")
             return jsonify({
-                "error": "Username/username_file and password/password_file are required"
+                "error": "Provide at least one of username/username_file/"
+                         "password/password_file/additional_args"
             }), 400
+
+        # Vanilla hydra (9.x) has no http-json module — serve it built-in.
+        if service.lower() in ("http-json", "https-json"):
+            return _hydra_http_json_brute(params)
 
         try:
             target = validate_target(target)
@@ -12022,9 +12274,14 @@ def hydra():
         argv += [target, service]
 
         logger.info(f"🔑 Starting Hydra attack: {target}:{service}")
-        result = execute_command(argv)
+        # Guarded path (lab-debrief BUG-4 consistency): hydra is DESTRUCTIVE
+        # tier — scope/tier/kill/rate gates and the audit log now apply
+        # (was a bare execute_command, invisible to guardrails).
+        gr_params = dict(params)
+        gr_params["target"] = target
+        result = execute_tool_command("hydra", argv, target, gr_params)
         logger.info(f"📊 Hydra attack completed for {target}")
-        return jsonify(result)
+        return _tool_response(result)
     except Exception as e:
         logger.error(f"💥 Error in hydra endpoint: {str(e)}")
         return jsonify({
@@ -14311,6 +14568,296 @@ def _httpx_pd_flags(params: Dict[str, Any]) -> list:
     return flags
 
 
+# ---------------------------------------------------------------------------
+# Built-in HTTP probe helpers (v6.6.0, lab-debrief BUG-1/2/6/7/9).
+#
+# When the projectdiscovery httpx binary is unavailable (only the Python
+# encode/httpx CLI — or nothing at all), /api/tools/httpx used to dead-end
+# with 501/503 even though tech-detect and liveness probing are plain HTTP
+# requests the server can make itself. These primitives also power the
+# gobuster catch-all auto-retry and the nuclei/nikto "silent target" hints.
+# All outbound requests carry browser-like headers: several lab targets
+# (Cloudflare-fronted CTFd) answered 403 to anything identifying as a script.
+# ---------------------------------------------------------------------------
+
+_BROWSER_LIKE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) "
+                   "Gecko/20100101 Firefox/128.0"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
+
+def _http_fetch(url, *, method="GET", timeout=10, json_body=None,
+                raw_body=None, extra_headers=None, fetch=None):
+    """Single HTTP request with browser-like headers.
+
+    ``fetch`` is an injectable replacement for :func:`requests.request`
+    (unit tests pass a stub instead of touching the network).
+    """
+    if fetch is not None:
+        return fetch(url, method=method, timeout=timeout, json_body=json_body,
+                     raw_body=raw_body, extra_headers=extra_headers)
+    headers = dict(_BROWSER_LIKE_HEADERS)
+    if extra_headers:
+        headers.update(extra_headers)
+    kwargs = {}
+    if json_body is not None:
+        kwargs["json"] = json_body
+    if raw_body is not None:
+        kwargs["data"] = raw_body.encode("utf-8")
+        headers.setdefault("Content-Type", "application/json")
+    return requests.request(method, url, headers=headers,
+                            timeout=timeout, allow_redirects=True, **kwargs)
+
+
+def _response_length(resp) -> int:
+    """Content length even when the Content-Length header is absent."""
+    val = None
+    try:
+        val = resp.headers.get("Content-Length")
+        if val is not None:
+            return int(val)
+    except (ValueError, TypeError, AttributeError):
+        pass
+    content = getattr(resp, "content", b"") or b""
+    return len(content)
+
+
+def _is_cdn_blocked(resp) -> bool:
+    """Cloudflare-style block page: 403/429/503 plus a CDN fingerprint."""
+    if resp.status_code not in (403, 429, 503):
+        return False
+    server = (resp.headers.get("Server") or "").lower()
+    return ("cloudflare" in server or "cf-ray" in resp.headers
+            or "cf-mitigated" in resp.headers)
+
+
+def probe_catch_all(url, fetch=None, timeout=10) -> Optional[Dict[str, Any]]:
+    """Detect a catch-all (wildcard) web target.
+
+    Fetches two random nonexistent paths; when both answer with the same
+    status code AND the same body length, every wordlist entry will look
+    like it "exists" and directory brute / vuln scans on this target need
+    length-based filtering (gobuster ``--exclude-length``) or manual
+    analysis. Returns ``{"status": int, "length": int}`` for a catch-all,
+    ``None`` otherwise (including unreachable targets).
+    """
+    import secrets
+    paths = [f"hxstrike-{secrets.token_hex(8)}" for _ in range(2)]
+    try:
+        responses = [
+            _http_fetch(f"{url.rstrip('/')}/{p}", fetch=fetch, timeout=timeout)
+            for p in paths
+        ]
+    except Exception:
+        return None
+    if any(r is None for r in responses):
+        return None
+    statuses = [r.status_code for r in responses]
+    lengths = [_response_length(r) for r in responses]
+    if statuses[0] != statuses[1] or lengths[0] != lengths[1]:
+        return None
+    return {"status": statuses[0], "length": lengths[0]}
+
+
+def _looks_like_gobuster_wildcard_error(text: str) -> bool:
+    """Match gobuster 3.x's 'status code matches for non existing dirs' bail."""
+    lowered = (text or "").lower()
+    if not lowered:
+        return False
+    return ("matches the provided options" in lowered
+            or "for non existing directories" in lowered
+            or ("wildcard" in lowered and "exclude" in lowered))
+
+
+# Statuses gobuster dir matches by default (its own default -s set).
+_GOBUSTER_DEFAULT_MATCH = {200, 204, 301, 302, 307, 401, 403}
+
+
+def _gobuster_declared_status_codes(argv: list) -> Optional[set]:
+    """Extract the status-code set the caller passed via -s/--status-codes."""
+    for i, tok in enumerate(argv):
+        if tok in ("-s", "--status-codes", "--status-codes-blacklist",
+                   "-b", "--exclude-status-codes"):
+            if i + 1 < len(argv):
+                try:
+                    vals = {int(x) for x in argv[i + 1].split(",") if x}
+                except ValueError:
+                    return None
+                if tok in ("-b", "--exclude-status-codes",
+                           "--status-codes-blacklist"):
+                    return _GOBUSTER_DEFAULT_MATCH - vals
+                return vals
+        for prefix in ("--status-codes=", "--exclude-status-codes=",
+                       "--status-codes-blacklist="):
+            if tok.startswith(prefix):
+                try:
+                    vals = {int(x) for x in tok[len(prefix):].split(",") if x}
+                except ValueError:
+                    return None
+                if "exclude" in prefix or "blacklist" in prefix:
+                    return _GOBUSTER_DEFAULT_MATCH - vals
+                return vals
+    return None
+
+
+def _httpx_builtin_probe(target: str, mode: str, fetch=None) -> Dict[str, Any]:
+    """Pure-Python httpx replacement: liveness probe + technology detection.
+
+    Serves mode=probe and mode=tech-detect when the projectdiscovery binary
+    is unavailable, so the answer is a real result instead of 501/503.
+    """
+    url = target if "://" in target else f"http://{target}"
+    resp = _http_fetch(url, fetch=fetch)
+    if resp is None:
+        raise RuntimeError(f"no response from {url}")
+    headers = {str(k): str(v) for k, v in resp.headers.items()}
+    content = (getattr(resp, "text", "") or "")[:50000]
+    title = ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", content,
+                  re.IGNORECASE | re.DOTALL)
+    if m:
+        title = re.sub(r"\s+", " ", m.group(1)).strip()[:200]
+    technologies = tech_detector.detect_technologies(
+        _host_of(url), headers=headers, content=content)
+    return {
+        "success": True,
+        "fallback": "builtin-http-probe",
+        "mode": mode or "probe",
+        "url": str(getattr(resp, "url", url)),
+        "status_code": resp.status_code,
+        "content_length": _response_length(resp),
+        "web_server": resp.headers.get("Server") or "",
+        "title": title,
+        "technologies": technologies,
+        "behind_cloudflare": (
+            "cf-ray" in resp.headers
+            or "cloudflare" in (resp.headers.get("Server") or "").lower()
+        ),
+    }
+
+
+def _silent_target_hints(target: str, tool: str,
+                         params: Optional[Dict[str, Any]] = None) -> list:
+    """Explain why a scan that ran fine produced nothing (lab-debrief BUG-9).
+
+    nuclei/nikto return an empty stdout both when a target is clean AND when
+    the target is unscannable by CLI tools (catch-all 200s, CDN block). An
+    autonomous agent cannot tell those apart — hand it the difference:
+    after a clean-looking zero-finding run, probe the target once and attach
+    an explicit hint instead of silence.
+    """
+    url = target if "://" in target else f"http://{target}"
+    host = _host_of(url) or target
+    state, decision = _guardrails_preflight(tool, host, params=params)
+    hints: list = []
+    if decision is not None and not decision.allowed:
+        # scope changed mid-scan — do not touch the target again
+        return hints
+    try:
+        wl = probe_catch_all(url)
+        if wl is not None:
+            hints.append({
+                "type": "catch_all_target",
+                "detail": f"every path answers status={wl['status']} "
+                          f"length={wl['length']}",
+                "suggestion": "status/length matching is unreliable here — "
+                              "verify findings manually (execute_command + "
+                              "curl, compare response bodies) and use "
+                              "--exclude-length style filtering",
+            })
+            return hints
+        resp = _http_fetch(url)
+        if _is_cdn_blocked(resp):
+            hints.append({
+                "type": "cloudflare_block",
+                "detail": f"probe got {resp.status_code} from a CDN "
+                          f"(server={resp.headers.get('Server', '')!r})",
+                "suggestion": "the CDN blocks CLI scanners; drive a browser "
+                              "session against this target instead",
+            })
+    except Exception:
+        pass
+    finally:
+        if state is not None and decision is not None and decision.allowed:
+            try:
+                state.release_target(host)
+            except Exception:
+                pass
+    return hints
+
+
+def _guardrails_preflight(tool: str, target: Optional[str],
+                          params: Optional[Dict[str, Any]] = None,
+                          confirmed: bool = False):
+    """Gate an in-process action (not an argv tool run) through guardrails.
+
+    Returns ``(state, decision)``. ``decision is not None`` and
+    ``not decision.allowed`` means the caller must answer with the mapped
+    HTTP error instead of acting. ``state``/``decision`` of ``None`` mean
+    guardrails is down — run unguarded, matching the rest of the server.
+    """
+    try:
+        from hexstrike_guardrails import get_state as _gr_get_state
+        state = _gr_get_state()
+    except Exception:
+        return None, None
+    if state is None:
+        return None, None
+    try:
+        decision = state.check(tool, target, params=params,
+                               confirmed=confirmed)
+    except Exception:
+        logger.exception("guardrails preflight crashed; allowing")
+        return state, None
+    return state, decision
+
+
+def _guardrails_block_response(tool: str, target: Optional[str], decision):
+    """JSON error matching the tier/scope/rate status mapping."""
+    status = {"rate": 429, "kill": 503}.get(decision.reason, 403)
+    return jsonify({
+        "success": False,
+        "error": "blocked_by_guardrails",
+        "reason": decision.reason,
+        "detail": decision.detail,
+        "hint": ("pass confirmed=true in the tool call to authorise a "
+                 "destructive tool" if decision.reason == "tier" else None),
+        "tool": tool,
+        "target": target,
+    }), status
+
+
+def _run_builtin_httpx(target: str, params: Dict[str, Any]):
+    """Serve /api/tools/httpx from the built-in probe (guardrails-gated)."""
+    host = _host_of(target) or target
+    state, decision = _guardrails_preflight(
+        "httpx", host, params=params,
+        confirmed=bool(params.get("confirmed")))
+    if decision is not None and not decision.allowed:
+        logger.warning(f"🛑 builtin httpx probe blocked: target={host} "
+                       f"reason={decision.reason}")
+        return _guardrails_block_response("httpx", host, decision)
+    try:
+        result = _httpx_builtin_probe(target, params.get("mode", ""))
+        return jsonify(result)
+    except Exception as exc:
+        logger.error(f"💥 builtin httpx probe failed: {exc}")
+        return jsonify({
+            "error": f"builtin probe failed: {exc}",
+            "hint": "install projectdiscovery/httpx: go install "
+                    "github.com/projectdiscovery/httpx/cmd/httpx@latest "
+                    "(or set HEXSTRIKE_HTTPX_BIN)",
+        }), 502
+    finally:
+        if state is not None and decision is not None and decision.allowed:
+            try:
+                state.release_target(host)
+            except Exception:
+                pass
+
+
 @app.route("/api/tools/httpx", methods=["POST"])
 def httpx():
     """Execute httpx for fast HTTP probing and technology detection"""
@@ -14349,14 +14896,12 @@ def httpx():
 
         if variant == "python":
             # encode/httpx CLI fallback: URL positional, plain GET probe.
-            # Tech-detection and per-flag output control are unsupported.
+            # Tech-detection is unsupported there — instead of a 501 dead
+            # end (lab debrief BUG-1) the built-in Python probe answers
+            # with headers/content fingerprinting via TechnologyDetector.
             if mode == "tech-detect":
-                return jsonify({
-                    "error": "tech-detect requires projectdiscovery/httpx",
-                    "hint": "go install github.com/projectdiscovery/httpx/cmd/httpx@latest",
-                    "found": binary,
-                    "variant": "python",
-                }), 501
+                logger.info(f"🌍 httpx tech-detect via builtin probe: {target}")
+                return _run_builtin_httpx(target, params)
             url = target if "://" in target else f"http://{target}"
             argv = [binary, url]
             logger.info(f"🌍 Starting httpx probe (python fallback): {target}")
@@ -14364,6 +14909,12 @@ def httpx():
             if isinstance(result, dict):
                 result["fallback"] = "python-httpx"
             return jsonify(result)
+
+        # No usable httpx binary at all. probe/tech-detect are plain HTTP
+        # requests — serve them built-in rather than failing with 503.
+        if mode in ("probe", "tech-detect", ""):
+            logger.info(f"🌍 httpx {mode or 'probe'} via builtin probe: {target}")
+            return _run_builtin_httpx(target, params)
 
         return jsonify({
             "error": "httpx binary not found or not functional",
@@ -18330,7 +18881,8 @@ def execute_with_recovery_endpoint():
         command = data.get("command", "")
         parameters = data.get("parameters", {})
         max_attempts = data.get("max_attempts", 3)
-        use_cache = data.get("use_cache", True)
+        # Cache OFF by default (lab-debrief BUG-3) — see execute_command.
+        use_cache = data.get("use_cache", False)
 
         if not tool_name or not command:
             return jsonify({"error": "tool_name and command are required"}), 400

@@ -680,7 +680,10 @@ class AsyncHexStrikeClient:
     def check_health(self) -> Dict[str, Any]:
         return self.safe_get("health?json")
 
-    def execute_command(self, command: str, use_cache: bool = True) -> Dict[str, Any]:
+    def execute_command(self, command: str, use_cache: bool = False) -> Dict[str, Any]:
+        # Cache OFF by default (lab-debrief BUG-3): re-running an identical
+        # command must hit the real world again — rotating CTF instances and
+        # restarted services made cached stdout lie to the agent.
         return self.safe_post("api/command", {"command": command, "use_cache": use_cache})
 
     def get_stats(self) -> Dict[str, Any]:
@@ -711,8 +714,12 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
     #                   (backward compatible, similar token load to v6.4.0)
     # Lean:    HEXSTRIKE_MCP_PROFILE=recon      → only 7 tools (~2 400 tok)
     # Modern:  HEXSTRIKE_MCP_PROFILE=full HEXSTRIKE_MCP_ALIASES=0 → 13 tools (~4 000 tok)
+    # create_file rides in every profile (lab-debrief BUG-5): it is the file
+    # bridge into the *server* execution context — without it registered,
+    # agents in lean profiles smuggled files via base64 through
+    # execute_command instead of using this verb.
     _MINIMAL = {"execute_command", "intelligent_smart_scan",
-                "analyze_target_intelligence", "batch_execute"}
+                "analyze_target_intelligence", "batch_execute", "create_file"}
     _RECON = _MINIMAL | {"port_scan", "subdomain_enum", "http_probe"}
     _WEB = _RECON | {"directory_brute", "web_vuln_scan"}
     _EXPLOIT = _WEB | {"sqlmap_scan", "hydra_attack", "metasploit_run", "cloud_audit"}
@@ -1177,19 +1184,25 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
         url: Annotated[str, Field(description="The target URL")],
         data: Annotated[str, Field(description="POST data for testing")] = "",
         additional_args: Annotated[str, Field(description="Additional SQLMap arguments")] = "",
+        confirmed: Annotated[bool, Field(description="Authorise the DESTRUCTIVE tier check. sqlmap is tier=DESTRUCTIVE: without confirmed=true the server answers 403. Set it once the target is verified to be in scope")] = False,
     ) -> Dict[str, Any]:
         """
-        Execute SQLMap for SQL injection testing.
+        [DESTRUCTIVE] Execute SQLMap for SQL injection testing.
+        Pass confirmed=true after verifying the target is in scope — the
+        guardrails tier gate blocks the call with 403 otherwise (nmap/curl
+        are INTRUSIVE tier and pass freely; that asymmetry is intentional).
 
         Args:
             url: The target URL
             data: POST data for testing
             additional_args: Additional SQLMap arguments
+            confirmed: Authorise the destructive-tier gate (default False)
 
         Returns:
             SQL injection test results
         """
-        data_payload = {"url": url, "data": data, "additional_args": additional_args}
+        data_payload = {"url": url, "data": data, "additional_args": additional_args,
+                        "confirmed": confirmed}
         logger.info(f"💉 Starting SQLMap scan: {url}")
         result = hexstrike_client.safe_post("api/tools/sqlmap", data_payload)
         if result.get("success"):
@@ -1200,31 +1213,44 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
 
     @_tool("hydra_attack")
     def hydra_attack(
-        target: Annotated[str, Field(description="The target IP or hostname")],
-        service: Annotated[str, Field(description="The service to attack (ssh, ftp, http, etc.)")],
+        target: Annotated[str, Field(description="The target IP or hostname (for http-json: the full login endpoint URL)")],
+        service: Annotated[str, Field(description="Service/module to attack: ssh, ftp, http-post-form, ... or 'http-json' for the built-in JSON-API brute (vanilla hydra has no such module)")],
         username: Annotated[str, Field(description="Single username to test")] = "",
         username_file: Annotated[str, Field(description="File containing usernames")] = "",
         password: Annotated[str, Field(description="Single password to test")] = "",
         password_file: Annotated[str, Field(description="File containing passwords")] = "",
         additional_args: Annotated[str, Field(description="Additional Hydra arguments")] = "",
+        json_body: Annotated[str, Field(description="http-json only: request template with ^USER^/^PASS^ placeholders, e.g. '{\"username\":\"^USER^\",\"password\":\"^PASS^\"}'")] = "",
+        success_marker: Annotated[str, Field(description="http-json only: substring present in a successful login response (e.g. 'token')")] = "",
+        failure_marker: Annotated[str, Field(description="http-json only: substring present in a failed login response (success = absence)")] = "",
+        confirmed: Annotated[bool, Field(description="Authorise the DESTRUCTIVE tier check (hydra is DESTRUCTIVE; 403 without it)")] = False,
     ) -> Dict[str, Any]:
         """
-        Execute Hydra for password brute forcing.
+        [DESTRUCTIVE] Execute Hydra for password brute forcing.
+        For custom JSON login APIs use service='http-json' with json_body +
+        success_marker (or failure_marker) — served by a built-in brute
+        forcer, since vanilla hydra has no http-json module.
 
         Args:
-            target: The target IP or hostname
-            service: The service to attack (ssh, ftp, http, etc.)
+            target: The target IP or hostname (http-json: full endpoint URL)
+            service: Hydra module or 'http-json'
             username: Single username to test
             username_file: File containing usernames
             password: Single password to test
             password_file: File containing passwords
             additional_args: Additional Hydra arguments
+            json_body: http-json request template (^USER^/^PASS^)
+            success_marker: http-json success indicator
+            failure_marker: http-json failure indicator
+            confirmed: Authorise the destructive-tier gate (default False)
 
         Returns:
             Brute force attack results
         """
         data = {"target": target, "service": service, "username": username, "username_file": username_file,
-                "password": password, "password_file": password_file, "additional_args": additional_args}
+                "password": password, "password_file": password_file, "additional_args": additional_args,
+                "json_body": json_body, "success_marker": success_marker, "failure_marker": failure_marker,
+                "confirmed": confirmed}
         logger.info(f"🔑 Starting Hydra attack: {target}:{service}")
         result = hexstrike_client.safe_post("api/tools/hydra", data)
         if result.get("success"):
@@ -1529,14 +1555,15 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
     @_tool("execute_command")
     def execute_command(
         command: Annotated[str, Field(description="The command to execute")],
-        use_cache: Annotated[bool, Field(description="Whether to use caching")] = True,
+        use_cache: Annotated[bool, Field(description="Cache the result and replay it for identical commands. OFF by default: identical commands usually need fresh state (rotating instances, changed files) — enable only for genuinely deterministic commands")] = False,
     ) -> Dict[str, Any]:
         """
         Execute an arbitrary command on the HexStrike AI server.
 
         Args:
             command: The command to execute
-            use_cache: Whether to use caching
+            use_cache: Whether to use caching (default False — cached output
+                goes stale and lies; opt in only for deterministic commands)
 
         Returns:
             Command execution results
@@ -1604,7 +1631,7 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
             logger.error(f"❌ Target analysis failed for {target}")
         return result
 
-    @_tool("create_file", full_only=True)
+    @_tool("create_file")
     def create_file(
         filename: Annotated[str, Field(description="Name of the file to create")],
         content: Annotated[str, Field(description="Content to write to the file")],
@@ -1612,6 +1639,11 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient,
     ) -> Dict[str, Any]:
         """
         Create a file with specified content on the HexStrike server.
+
+        This is the bridge for files that execute_command needs in the
+        SERVER's context (wordlists, scripts, payloads): what exists locally
+        for the agent does NOT exist on the server — write it here first,
+        then reference the returned server-side path.
 
         Args:
             filename: Name of the file to create
