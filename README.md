@@ -1,3 +1,5 @@
+
+
 # HexStrike AI — Chumikov Sec Fork
 
 Форк [HexStrike-AI](https://github.com/0x4m4/hexstrike-ai): REST-API + MCP-мост для управления security-инструментами (nmap, nuclei, sqlmap, gobuster, metasploit и 140+ другими) из AI-агентов — OpenCode, Claude Desktop, Cursor, Cline. Проект развивается самостоятельно: асинхронное исполнение сканов, слой guardrails, персистентные сессии, тесты и CI.
@@ -99,7 +101,7 @@ hexstrike_mcp.py  ──HTTP──►  hexstrike_server.py (Flask + gunicorn, :8
 
 ## Деплой
 
-`deploy.sh` выполняет всё автоматически: проверка окружения (root, `hexstrike-ai`, Python, архитектура) → копирование файлов → venv с `--system-site-packages` → зависимости → gunicorn wrapper → освобождение порта 8888 → systemd unit → `enable` + `start` → ожидание health-check → итоговая сводка. Дополнительно создаётся выключенный по умолчанию юнит `hexstrike-mcp.service` (для streamable/sse-транспорта). При ошибке на любом шаге выводит `systemctl status` и `journalctl`.
+`deploy.sh` выполняет всё автоматически: проверка окружения (root, `hexstrike-ai`, Python, PyPI) → копирование файлов → venv с `--system-site-packages` → зависимости → gunicorn wrapper → освобождение порта 8888 → systemd unit → `enable` + `start` → ожидание health-check → итоговая сводка. Дополнительно создаётся выключенный по умолчанию юнит `hexstrike-mcp.service` (для streamable/sse-транспорта). При ошибке на любом шаге выводит `systemctl status` и `journalctl`.
 
 Ручная проверка после деплоя:
 
